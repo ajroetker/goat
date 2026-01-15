@@ -178,8 +178,10 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 		if function.Type != "void" {
 			if sz := NeonTypeSize(function.Type); sz > 0 {
 				returnSize = sz // Use actual NEON type size
+			} else if sz, ok := supportedTypes[function.Type]; ok {
+				returnSize = sz // Use actual scalar type size
 			} else {
-				returnSize = 8 // All scalars use 8-byte slots in Go ABI0
+				returnSize = 8 // Default 8-byte slot for pointers/unknown types
 			}
 		}
 		registerCount, fpRegisterCount, neonRegisterCount, offset := 0, 0, 0, 0
@@ -224,8 +226,10 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 							argsBuilder.WriteString(fmt.Sprintf("\tVMOV R9, %s.D[0]\n", neonRegisters[neonRegisterCount+v]))
 						} else {
 							// 128-bit vector: two MOVDs, load into D[0] and D[1]
-							argsBuilder.WriteString(fmt.Sprintf("\tMOVD %s+%d(FP), R9\n", param.Name, vecOffset))
-							argsBuilder.WriteString(fmt.Sprintf("\tMOVD %s+%d(FP), R10\n", param.Name, vecOffset+8))
+							// Use _N suffixes (N=offset within param) so go vet accepts different offsets
+							localOffset := v * 16 // offset within this parameter's storage
+							argsBuilder.WriteString(fmt.Sprintf("\tMOVD %s_%d+%d(FP), R9\n", param.Name, localOffset, vecOffset))
+							argsBuilder.WriteString(fmt.Sprintf("\tMOVD %s_%d+%d(FP), R10\n", param.Name, localOffset+8, vecOffset+8))
 							argsBuilder.WriteString(fmt.Sprintf("\tVMOV R9, %s.D[0]\n", neonRegisters[neonRegisterCount+v]))
 							argsBuilder.WriteString(fmt.Sprintf("\tVMOV R10, %s.D[1]\n", neonRegisters[neonRegisterCount+v]))
 						}
@@ -288,9 +292,11 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 							stackOffset += 8
 						} else {
 							// 128-bit vector: two 8-byte copies
-							argsBuilder.WriteString(fmt.Sprintf("\tMOVD %s+%d(FP), R8\n", stack[i].B.Name, srcOffset))
+							// Use _N suffixes (N=offset within param) so go vet accepts different offsets
+							localOffset := v * 16 // offset within this parameter's storage
+							argsBuilder.WriteString(fmt.Sprintf("\tMOVD %s_%d+%d(FP), R8\n", stack[i].B.Name, localOffset, srcOffset))
 							argsBuilder.WriteString(fmt.Sprintf("\tMOVD R8, %d(RSP)\n", stackOffset))
-							argsBuilder.WriteString(fmt.Sprintf("\tMOVD %s+%d(FP), R8\n", stack[i].B.Name, srcOffset+8))
+							argsBuilder.WriteString(fmt.Sprintf("\tMOVD %s_%d+%d(FP), R8\n", stack[i].B.Name, localOffset+8, srcOffset+8))
 							argsBuilder.WriteString(fmt.Sprintf("\tMOVD R8, %d(RSP)\n", stackOffset+8))
 							stackOffset += 16
 						}
@@ -346,10 +352,12 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 									resultOffset += 8
 								} else {
 									// 128-bit vector: extract both D[0] and D[1]
+									// Use _N suffixes (N=offset within result) so go vet accepts different offsets
+									localOffset := v * 16 // offset within result parameter
 									builder.WriteString(fmt.Sprintf("\tVMOV %s.D[0], R9\n", vReg))
 									builder.WriteString(fmt.Sprintf("\tVMOV %s.D[1], R10\n", vReg))
-									builder.WriteString(fmt.Sprintf("\tMOVD R9, result+%d(FP)\n", resultOffset))
-									builder.WriteString(fmt.Sprintf("\tMOVD R10, result+%d(FP)\n", resultOffset+8))
+									builder.WriteString(fmt.Sprintf("\tMOVD R9, result_%d+%d(FP)\n", localOffset, resultOffset))
+									builder.WriteString(fmt.Sprintf("\tMOVD R10, result_%d+%d(FP)\n", localOffset+8, resultOffset+8))
 									resultOffset += 16
 								}
 							}

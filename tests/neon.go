@@ -3,8 +3,8 @@
 // versions:
 // 	clang   21.1.8
 // 	objdump 2.45.1
-// flags: -O3
-// source: tests/src/neon.c
+// flags: -O0
+// source: src/neon.c
 
 package tests
 
