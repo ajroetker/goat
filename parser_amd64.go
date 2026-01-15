@@ -333,7 +333,7 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 			offset += sz
 		}
 
-		// Align to 16 bytes if using SIMD types
+		// Check if SIMD types are used (for stack frame alignment)
 		hasSIMD := false
 		for _, param := range function.Parameters {
 			if !param.Pointer && IsX86SIMDType(param.Type) {
@@ -344,9 +344,8 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 		if !hasSIMD && IsX86SIMDType(function.Type) {
 			hasSIMD = true
 		}
-		if hasSIMD && offset%16 != 0 {
-			offset += 16 - offset%16
-		}
+		// Note: Don't align offset to 16 bytes here - Go's ABI only requires 8-byte
+		// alignment for return values
 
 		// Calculate stack frame size (for spilled parameters)
 		stackOffset := 0
