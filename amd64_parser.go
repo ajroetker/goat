@@ -61,19 +61,11 @@ func (line *amd64Line) String() string {
 	builder.WriteString("\t")
 	if strings.HasPrefix(line.Assembly, "j") {
 		// Handle both Linux (jl .LBB0_1) and macOS (jl LBB0_1) jump formats
-		var op, operand string
-		if strings.Contains(line.Assembly, ".") {
-			// Linux format: jl .LBB0_1 - split by dot
-			splits := strings.Split(line.Assembly, ".")
-			op = strings.TrimSpace(splits[0])
-			operand = splits[1]
-		} else {
-			// macOS format: jl LBB0_1 - split by whitespace
-			fields := strings.Fields(line.Assembly)
-			op = fields[0]
-			// Label is the second field, strip L prefix to get BB0_1
-			operand = strings.TrimPrefix(fields[1], "L")
-		}
+		fields := strings.Fields(line.Assembly)
+		op := fields[0]
+		// Strip both . and L prefixes for consistency
+		operand := strings.TrimPrefix(fields[1], ".")
+		operand = strings.TrimPrefix(operand, "L")
 		builder.WriteString(fmt.Sprintf("%s %s", strings.ToUpper(op), operand))
 	} else {
 		pos := 0
@@ -226,10 +218,9 @@ func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]
 			// Check labels BEFORE function names because labels like "LBB0_2: ; comment"
 			// can match the function name pattern due to content after the colon
 			labelName = strings.Split(line, ":")[0]
-			// Strip leading dot if present (Linux uses .LBB0_2, macOS uses LBB0_2)
-			if strings.HasPrefix(labelName, ".") {
-				labelName = labelName[1:]
-			}
+			// Strip leading dot and L prefix (Linux uses .LBB0_2, macOS uses LBB0_2)
+			labelName = strings.TrimPrefix(labelName, ".")
+			labelName = strings.TrimPrefix(labelName, "L")
 			lines := functions[functionName]
 			if len(lines) > 0 && lines[len(lines)-1].Assembly == "" {
 				lines[len(lines)-1].Labels = append(lines[len(lines)-1].Labels, labelName)

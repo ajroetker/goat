@@ -67,7 +67,10 @@ func (line *arm64Line) String() string {
 			}
 			return unicode.ToUpper(r)
 		}, splits[0])
-		label := splits[1][1:]
+		// Handle both Linux (.LBB0_5) and macOS (LBB0_5) label formats
+		label := splits[1]
+		label = strings.TrimPrefix(label, ".")
+		label = strings.TrimPrefix(label, "L")
 		builder.WriteString(fmt.Sprintf("%s %s\n", instruction, label))
 	} else {
 		builder.WriteString("\t")
@@ -235,10 +238,9 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 			// Check labels BEFORE function names because labels like "LBB0_2: ; comment"
 			// can match the function name pattern due to content after the colon
 			labelName = strings.Split(line, ":")[0]
-			// Strip leading dot if present (Linux uses .LBB0_2, macOS uses LBB0_2)
-			if strings.HasPrefix(labelName, ".") {
-				labelName = labelName[1:]
-			}
+			// Strip leading dot and L prefix (Linux uses .LBB0_2, macOS uses LBB0_2)
+			labelName = strings.TrimPrefix(labelName, ".")
+			labelName = strings.TrimPrefix(labelName, "L")
 			lines := functions[functionName]
 			if len(lines) == 0 || lines[len(lines)-1].Assembly != "" {
 				functions[functionName] = append(functions[functionName], &arm64Line{Labels: []string{labelName}})
