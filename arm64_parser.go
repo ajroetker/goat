@@ -413,7 +413,7 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function)
 			offset += sz
 		}
 
-		// Align to 16 bytes only if 128-bit+ NEON types are used (not 64-bit)
+		// Check if 128-bit+ NEON types are used (for stack frame alignment)
 		has128BitNeon := false
 		for _, param := range function.Parameters {
 			if !param.Pointer && IsNeonType(param.Type) && !IsNeon64Type(param.Type) {
@@ -424,9 +424,9 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function)
 		if !has128BitNeon && IsNeonType(function.Type) && !IsNeon64Type(function.Type) {
 			has128BitNeon = true
 		}
-		if has128BitNeon && offset%16 != 0 {
-			offset += 16 - offset%16
-		}
+		// Note: Don't align offset to 16 bytes here - Go's ABI only requires 8-byte
+		// alignment for return values. The 16-byte alignment is only needed for the
+		// stack frame (stackOffset), not for the FP-relative parameter offsets.
 
 		stackOffset := 0
 		if len(stack) > 0 {
