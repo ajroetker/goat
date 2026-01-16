@@ -492,7 +492,25 @@ func injectStreamingModeConservative(lines []*arm64Line, firstSVE int) []*arm64L
 
 		// Inject smstop before ALL ret instructions in the function
 		// smstop when not in streaming mode is harmless (no-op)
+		//
+		// IMPORTANT: If the ret line also has labels (branch targets), we need to:
+		// 1. Put the labels on the smstop line (so branches land at smstop)
+		// 2. Then output ret (without labels)
+		// This ensures all paths to ret go through smstop.
 		if line.Assembly == "ret" {
+			if len(line.Labels) > 0 {
+				// Put labels on smstop, then ret without labels
+				result = append(result, &arm64Line{
+					Labels:   line.Labels,
+					Assembly: "smstop\tsm",
+					Binary:   "d503467f",
+				})
+				result = append(result, &arm64Line{
+					Assembly: "ret",
+				})
+				continue // Skip the normal line addition
+			}
+			// No labels - just add smstop before ret
 			result = append(result, &arm64Line{
 				Assembly: "smstop\tsm",
 				Binary:   "d503467f",
@@ -528,6 +546,12 @@ func isSVEInstruction(asm string) bool {
 // This handles cases where the compiler generated smstart but not smstop, and
 // also handles complex control flow where some paths may bypass streaming mode.
 // smstop when not in streaming mode is a no-op, so it's safe to add conservatively.
+//
+// IMPORTANT: We must add smstop before ALL ret instructions, even if some paths
+// already have smstop. This is because C code with multiple code paths may have:
+// - Main path: smstart -> ... -> ret (no smstop!)
+// - Edge path: smstart -> ... -> smstop -> ret (has smstop)
+// The edge path's smstop doesn't protect the main path's ret.
 func ensureSmstopBeforeRet(lines []*arm64Line) []*arm64Line {
 	// Find if there's an smstart
 	hasSmstart := false
@@ -542,31 +566,44 @@ func ensureSmstopBeforeRet(lines []*arm64Line) []*arm64Line {
 		return lines // No smstart, nothing to do
 	}
 
-	// Check if smstop already exists before a ret
-	// If so, the code may already be handling streaming mode correctly
-	hasSmstopBeforeRet := false
-	for i := 1; i < len(lines); i++ {
-		if lines[i].Assembly == "ret" && i > 0 &&
-			lines[i-1].Assembly != "" && strings.Contains(lines[i-1].Assembly, "smstop") {
-			hasSmstopBeforeRet = true
-			break
-		}
-	}
-
-	if hasSmstopBeforeRet {
-		return lines // Already has smstop before at least one ret
-	}
-
-	// Add smstop before ALL ret instructions
+	// Add smstop before ALL ret instructions that don't already have one.
+	// smstop when not in streaming mode is a no-op, so it's safe to add.
 	result := make([]*arm64Line, 0, len(lines)+5)
 
-	for _, line := range lines {
-		// Add smstop before ret
+	for i, line := range lines {
+		// Add smstop before ret if not already present
+		//
+		// IMPORTANT: If the ret line also has labels (branch targets), we need to:
+		// 1. Put the labels on the smstop line (so branches land at smstop)
+		// 2. Then output ret (without labels)
+		// This ensures all paths to ret go through smstop.
 		if line.Assembly == "ret" {
-			result = append(result, &arm64Line{
-				Assembly: "smstop\tsm",
-				Binary:   "d503467f",
-			})
+			if len(line.Labels) > 0 {
+				// Put labels on smstop, then ret without labels
+				result = append(result, &arm64Line{
+					Labels:   line.Labels,
+					Assembly: "smstop\tsm",
+					Binary:   "d503467f",
+				})
+				result = append(result, &arm64Line{
+					Assembly: "ret",
+				})
+				continue // Skip the normal line addition
+			}
+			// No labels - check if previous line is already smstop
+			alreadyHasSmstop := false
+			if i > 0 && len(result) > 0 {
+				prev := result[len(result)-1]
+				if prev.Assembly != "" && strings.Contains(prev.Assembly, "smstop") {
+					alreadyHasSmstop = true
+				}
+			}
+			if !alreadyHasSmstop {
+				result = append(result, &arm64Line{
+					Assembly: "smstop\tsm",
+					Binary:   "d503467f",
+				})
+			}
 		}
 		result = append(result, line)
 	}

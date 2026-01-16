@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -40,6 +41,10 @@ var (
 	arm64JmpLine    = regexp.MustCompile(`^(b|b\.\w{2})\t\.?\w+_\d+$`)
 	arm64SymbolLine = regexp.MustCompile(`^\w+\s+<\w+>:$`)
 	arm64DataLine   = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
+	// Match stack frame allocation: "sub sp, sp, #N" (with optional hex suffix)
+	arm64StackAllocLine = regexp.MustCompile(`^\s*sub\s+sp,\s*sp,\s*#(\d+)`)
+	// Match pre-decrement stack allocation: "stp ... [sp, #-N]!"
+	arm64StackPreDecLine = regexp.MustCompile(`\[sp,\s*#-(\d+)\]!`)
 )
 
 // arm64 register sets
@@ -266,6 +271,25 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 		} else if arm64CodeLine.MatchString(line) {
 			asm := strings.Split(line, "//")[0]
 			asm = strings.TrimSpace(asm)
+
+			// Detect stack frame allocation patterns:
+			// 1. "sub sp, sp, #N" - explicit stack allocation
+			// 2. "stp ... [sp, #-N]!" - pre-decrement stack allocation
+			// Record the maximum stack size for this function
+			if matches := arm64StackAllocLine.FindStringSubmatch(asm); matches != nil {
+				if size, err := strconv.Atoi(matches[1]); err == nil {
+					if current, ok := stackSizes[functionName]; !ok || size > current {
+						stackSizes[functionName] = size
+					}
+				}
+			} else if matches := arm64StackPreDecLine.FindStringSubmatch(asm); matches != nil {
+				if size, err := strconv.Atoi(matches[1]); err == nil {
+					if current, ok := stackSizes[functionName]; !ok || size > current {
+						stackSizes[functionName] = size
+					}
+				}
+			}
+
 			if labelName == "" {
 				functions[functionName] = append(functions[functionName], &arm64Line{Assembly: asm})
 			} else {
@@ -486,8 +510,15 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function)
 			offset += 8 - offset%8
 		}
 
+		// Use the larger of: calculated stack offset (for parameter spill) or
+		// detected stack size (from 'sub sp, sp, #N' in the compiled assembly)
+		frameSize := stackOffset
+		if function.StackSize > frameSize {
+			frameSize = function.StackSize
+		}
+
 		builder.WriteString(fmt.Sprintf("\nTEXT ·%v(SB), $%d-%d\n",
-			function.Name, stackOffset, offset+returnSize))
+			function.Name, frameSize, offset+returnSize))
 		builder.WriteString(argsBuilder.String())
 
 		// Convert interface{} lines back to arm64Line
