@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 package main
 
 import (
@@ -25,31 +26,34 @@ import (
 	"github.com/samber/lo"
 )
 
-const (
-	buildTags   = "//go:build !noasm && riscv64\n"
-	buildTarget = "riscv64-linux-gnu"
-)
+// RISCV64Parser implements ArchParser for RISC-V 64-bit architecture
+type RISCV64Parser struct{}
 
+// riscv64 regex patterns
 var (
-	attributeLine = regexp.MustCompile(`^\s+\..+$`)
-	nameLine      = regexp.MustCompile(`^\w+:.+$`)
-	labelLine     = regexp.MustCompile(`^\.\w+_\d+:.*$`)
-	codeLine      = regexp.MustCompile(`^\s+\w+.+$`)
-
-	symbolLine = regexp.MustCompile(`^\w+\s+<\w+>:$`)
-	dataLine   = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
-
-	registers   = []string{"A0", "A1", "A2", "A3", "A4", "A5", "A6", "A7"}
-	fpRegisters = []string{"FA0", "FA1", "FA2", "FA3", "FA4", "FA5", "FA6", "FA7"}
+	riscv64AttributeLine = regexp.MustCompile(`^\s+\..+$`)
+	riscv64NameLine      = regexp.MustCompile(`^\w+:.+$`)
+	riscv64LabelLine     = regexp.MustCompile(`^\.\w+_\d+:.*$`)
+	riscv64CodeLine      = regexp.MustCompile(`^\s+\w+.+$`)
+	riscv64SymbolLine    = regexp.MustCompile(`^\w+\s+<\w+>:$`)
+	riscv64DataLine      = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
 )
 
-type Line struct {
+// riscv64 register sets
+var (
+	riscv64Registers   = []string{"A0", "A1", "A2", "A3", "A4", "A5", "A6", "A7"}
+	riscv64FPRegisters = []string{"FA0", "FA1", "FA2", "FA3", "FA4", "FA5", "FA6", "FA7"}
+)
+
+// riscv64Line represents a single assembly instruction for RISC-V 64-bit
+// Binary is string because RISC-V has fixed-width 32-bit instructions
+type riscv64Line struct {
 	Labels   []string
 	Assembly string
 	Binary   string
 }
 
-func (line *Line) String() string {
+func (line *riscv64Line) String() string {
 	var builder strings.Builder
 	builder.WriteString("\t")
 	if strings.HasPrefix(line.Assembly, "b") {
@@ -75,7 +79,68 @@ func (line *Line) String() string {
 	return builder.String()
 }
 
-func parseAssembly(path string) (map[string][]Line, map[string]int, error) {
+// Name returns the architecture name
+func (p *RISCV64Parser) Name() string {
+	return "riscv64"
+}
+
+// BuildTags returns the Go build constraint
+func (p *RISCV64Parser) BuildTags() string {
+	return "//go:build !noasm && riscv64\n"
+}
+
+// BuildTarget returns the clang target triple
+func (p *RISCV64Parser) BuildTarget(goos string) string {
+	return "riscv64-linux-gnu"
+}
+
+// CompilerFlags returns architecture-specific compiler flags
+func (p *RISCV64Parser) CompilerFlags() []string {
+	return []string{"-ffixed-x27"}
+}
+
+// Prologue returns C parser prologue (empty for RISC-V - no special types)
+func (p *RISCV64Parser) Prologue() string {
+	return ""
+}
+
+// TranslateAssembly implements the full translation pipeline for RISC-V 64-bit
+func (p *RISCV64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) error {
+	// Parse assembly
+	assembly, stackSizes, err := p.parseAssembly(t.Assembly)
+	if err != nil {
+		return err
+	}
+
+	// Run objdump
+	dump, err := runCommand("objdump", "-d", t.Object)
+	if err != nil {
+		return err
+	}
+
+	// Parse object dump
+	if err := p.parseObjectDump(dump, assembly); err != nil {
+		return err
+	}
+
+	// Copy lines to functions
+	for i, fn := range functions {
+		if lines, ok := assembly[fn.Name]; ok {
+			functions[i].Lines = make([]interface{}, len(lines))
+			for j, line := range lines {
+				functions[i].Lines[j] = line
+			}
+		}
+		if sz, ok := stackSizes[fn.Name]; ok {
+			functions[i].StackSize = sz
+		}
+	}
+
+	// Generate Go assembly
+	return p.generateGoAssembly(t, functions)
+}
+
+func (p *RISCV64Parser) parseAssembly(path string) (map[string][]*riscv64Line, map[string]int, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, nil, err
@@ -89,32 +154,33 @@ func parseAssembly(path string) (map[string][]Line, map[string]int, error) {
 
 	var (
 		stackSizes   = make(map[string]int)
-		functions    = make(map[string][]Line)
+		functions    = make(map[string][]*riscv64Line)
 		functionName string
 		labelName    string
 	)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if attributeLine.MatchString(line) {
+		if riscv64AttributeLine.MatchString(line) {
 			continue
-		} else if nameLine.MatchString(line) {
+		} else if riscv64NameLine.MatchString(line) {
 			functionName = strings.Split(line, ":")[0]
-			functions[functionName] = make([]Line, 0)
-		} else if labelLine.MatchString(line) {
+			functions[functionName] = make([]*riscv64Line, 0)
+			labelName = ""
+		} else if riscv64LabelLine.MatchString(line) {
 			labelName = strings.Split(line, ":")[0]
 			labelName = labelName[1:]
 			lines := functions[functionName]
 			if len(lines) == 1 || lines[len(lines)-1].Assembly != "" {
-				functions[functionName] = append(functions[functionName], Line{Labels: []string{labelName}})
+				functions[functionName] = append(functions[functionName], &riscv64Line{Labels: []string{labelName}})
 			} else {
 				lines[len(lines)-1].Labels = append(lines[len(lines)-1].Labels, labelName)
 			}
-		} else if codeLine.MatchString(line) {
+		} else if riscv64CodeLine.MatchString(line) {
 			asm := strings.Split(line, "//")[0]
 			asm = strings.TrimSpace(asm)
 			if labelName == "" {
-				functions[functionName] = append(functions[functionName], Line{Assembly: asm})
+				functions[functionName] = append(functions[functionName], &riscv64Line{Assembly: asm})
 			} else {
 				lines := functions[functionName]
 				if len(lines) > 0 {
@@ -131,18 +197,18 @@ func parseAssembly(path string) (map[string][]Line, map[string]int, error) {
 	return functions, stackSizes, nil
 }
 
-func parseObjectDump(dump string, functions map[string][]Line) error {
+func (p *RISCV64Parser) parseObjectDump(dump string, functions map[string][]*riscv64Line) error {
 	var (
 		functionName string
 		lineNumber   int
 	)
 	for i, line := range strings.Split(dump, "\n") {
 		line = strings.TrimSpace(line)
-		if symbolLine.MatchString(line) {
+		if riscv64SymbolLine.MatchString(line) {
 			functionName = strings.Split(line, "<")[1]
 			functionName = strings.Split(functionName, ">")[0]
 			lineNumber = 0
-		} else if dataLine.MatchString(line) {
+		} else if riscv64DataLine.MatchString(line) {
 			data := strings.Split(line, ":")[1]
 			data = strings.TrimSpace(data)
 			splits := strings.Split(data, " ")
@@ -168,11 +234,12 @@ func parseObjectDump(dump string, functions map[string][]Line) error {
 	return nil
 }
 
-func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) error {
+func (p *RISCV64Parser) generateGoAssembly(t *TranslateUnit, functions []Function) error {
 	// generate code
 	var builder strings.Builder
-	builder.WriteString(buildTags)
+	builder.WriteString(p.BuildTags())
 	t.writeHeader(&builder)
+
 	for _, function := range functions {
 		// Calculate return size based on type
 		returnSize := 0
@@ -198,22 +265,22 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 				offset += sz - offset%sz
 			}
 			if !param.Pointer && (param.Type == "double" || param.Type == "float") {
-				if fpRegisterCount < len(fpRegisters) {
+				if fpRegisterCount < len(riscv64FPRegisters) {
 					if param.Type == "double" {
-						builder.WriteString(fmt.Sprintf("\tMOVD %s+%d(FP), %s\n", param.Name, offset, fpRegisters[fpRegisterCount]))
+						builder.WriteString(fmt.Sprintf("\tMOVD %s+%d(FP), %s\n", param.Name, offset, riscv64FPRegisters[fpRegisterCount]))
 					} else {
-						builder.WriteString(fmt.Sprintf("\tMOVF %s+%d(FP), %s\n", param.Name, offset, fpRegisters[fpRegisterCount]))
+						builder.WriteString(fmt.Sprintf("\tMOVF %s+%d(FP), %s\n", param.Name, offset, riscv64FPRegisters[fpRegisterCount]))
 					}
 					fpRegisterCount++
 				} else {
 					stack = append(stack, lo.Tuple2[int, Parameter]{A: offset, B: param})
 				}
 			} else {
-				if registerCount < len(registers) {
+				if registerCount < len(riscv64Registers) {
 					if param.Type == "_Bool" {
-						builder.WriteString(fmt.Sprintf("\tMOVB %s+%d(FP), %s\n", param.Name, offset, registers[registerCount]))
+						builder.WriteString(fmt.Sprintf("\tMOVB %s+%d(FP), %s\n", param.Name, offset, riscv64Registers[registerCount]))
 					} else {
-						builder.WriteString(fmt.Sprintf("\tMOV %s+%d(FP), %s\n", param.Name, offset, registers[registerCount]))
+						builder.WriteString(fmt.Sprintf("\tMOV %s+%d(FP), %s\n", param.Name, offset, riscv64Registers[registerCount]))
 					}
 					registerCount++
 				} else {
@@ -246,7 +313,13 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 				}
 			}
 		}
-		for _, line := range function.Lines {
+
+		// Convert interface{} lines back to riscv64Line
+		for _, lineIface := range function.Lines {
+			line, ok := lineIface.(*riscv64Line)
+			if !ok {
+				continue
+			}
 			for _, label := range line.Labels {
 				builder.WriteString(label)
 				builder.WriteString(":\n")
@@ -277,7 +350,7 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 	}
 
 	// write file
-	f, err := os.Create(path)
+	f, err := os.Create(t.GoAssembly)
 	if err != nil {
 		return err
 	}
@@ -293,4 +366,8 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 	}
 	_, err = f.Write(bytes)
 	return err
+}
+
+func init() {
+	RegisterParser("riscv64", &RISCV64Parser{})
 }

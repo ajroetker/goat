@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 package main
 
 import (
@@ -18,7 +19,6 @@ import (
 	"fmt"
 	"os"
 	"regexp"
-	"runtime"
 	"strings"
 	"unicode"
 
@@ -26,38 +26,36 @@ import (
 	"github.com/samber/lo"
 )
 
+// AMD64Parser implements ArchParser for x86-64 architecture
+type AMD64Parser struct{}
+
+// amd64 regex patterns
 var (
-	buildTags   = "//go:build !noasm && amd64\n"
-	buildTarget = func() string {
-		if runtime.GOOS == "darwin" {
-			return "x86_64-apple-darwin"
-		}
-		return "x86_64-linux-gnu"
-	}()
+	amd64AttributeLine = regexp.MustCompile(`^\s+\..+$`)
+	amd64NameLine      = regexp.MustCompile(`^\w+:.+$`)
+	amd64LabelLine     = regexp.MustCompile(`^\.\w+_\d+:.*$`)
+	amd64CodeLine      = regexp.MustCompile(`^\s+\w+.+$`)
+	amd64SymbolLine    = regexp.MustCompile(`^\w+\s+<\w+>:$`)
+	amd64DataLine      = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
 )
 
+// amd64 register sets
 var (
-	attributeLine = regexp.MustCompile(`^\s+\..+$`)
-	nameLine      = regexp.MustCompile(`^\w+:.+$`)
-	labelLine     = regexp.MustCompile(`^\.\w+_\d+:.*$`)
-	codeLine      = regexp.MustCompile(`^\s+\w+.+$`)
-
-	symbolLine = regexp.MustCompile(`^\w+\s+<\w+>:$`)
-	dataLine   = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
-
-	registers    = []string{"DI", "SI", "DX", "CX", "R8", "R9"}
-	xmmRegisters = []string{"X0", "X1", "X2", "X3", "X4", "X5", "X6", "X7"} // 128-bit SSE
-	ymmRegisters = []string{"Y0", "Y1", "Y2", "Y3", "Y4", "Y5", "Y6", "Y7"} // 256-bit AVX
-	zmmRegisters = []string{"Z0", "Z1", "Z2", "Z3", "Z4", "Z5", "Z6", "Z7"} // 512-bit AVX-512
+	amd64Registers    = []string{"DI", "SI", "DX", "CX", "R8", "R9"}
+	amd64XMMRegisters = []string{"X0", "X1", "X2", "X3", "X4", "X5", "X6", "X7"} // 128-bit SSE
+	amd64YMMRegisters = []string{"Y0", "Y1", "Y2", "Y3", "Y4", "Y5", "Y6", "Y7"} // 256-bit AVX
+	amd64ZMMRegisters = []string{"Z0", "Z1", "Z2", "Z3", "Z4", "Z5", "Z6", "Z7"} // 512-bit AVX-512
 )
 
-type Line struct {
+// amd64Line represents a single assembly instruction for AMD64
+// Binary is []string because x86 has variable-length instructions
+type amd64Line struct {
 	Labels   []string
 	Assembly string
 	Binary   []string
 }
 
-func (line *Line) String() string {
+func (line *amd64Line) String() string {
 	var builder strings.Builder
 	builder.WriteString("\t")
 	if strings.HasPrefix(line.Assembly, "j") {
@@ -95,7 +93,84 @@ func (line *Line) String() string {
 	return builder.String()
 }
 
-func parseAssembly(path string) (map[string][]Line, map[string]int, error) {
+// Name returns the architecture name
+func (p *AMD64Parser) Name() string {
+	return "amd64"
+}
+
+// BuildTags returns the Go build constraint
+func (p *AMD64Parser) BuildTags() string {
+	return "//go:build !noasm && amd64\n"
+}
+
+// BuildTarget returns the clang target triple
+func (p *AMD64Parser) BuildTarget(goos string) string {
+	if goos == "darwin" {
+		return "x86_64-apple-darwin"
+	}
+	return "x86_64-linux-gnu"
+}
+
+// CompilerFlags returns architecture-specific compiler flags
+func (p *AMD64Parser) CompilerFlags() []string {
+	return nil // AMD64 doesn't need special fixed-register flags
+}
+
+// Prologue returns C parser prologue for x86 SIMD types
+func (p *AMD64Parser) Prologue() string {
+	var prologue strings.Builder
+	// Define GOAT_PARSER to skip includes during parsing
+	prologue.WriteString("#define GOAT_PARSER 1\n")
+	// Define x86 SIMD types as opaque structs for the parser
+	prologue.WriteString("typedef struct { char _[16]; } __m128;\n")
+	prologue.WriteString("typedef struct { char _[16]; } __m128d;\n")
+	prologue.WriteString("typedef struct { char _[16]; } __m128i;\n")
+	prologue.WriteString("typedef struct { char _[32]; } __m256;\n")
+	prologue.WriteString("typedef struct { char _[32]; } __m256d;\n")
+	prologue.WriteString("typedef struct { char _[32]; } __m256i;\n")
+	prologue.WriteString("typedef struct { char _[64]; } __m512;\n")
+	prologue.WriteString("typedef struct { char _[64]; } __m512d;\n")
+	prologue.WriteString("typedef struct { char _[64]; } __m512i;\n")
+	return prologue.String()
+}
+
+// TranslateAssembly implements the full translation pipeline for AMD64
+func (p *AMD64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) error {
+	// Parse assembly
+	assembly, stackSizes, err := p.parseAssembly(t.Assembly, t.TargetOS)
+	if err != nil {
+		return err
+	}
+
+	// Run objdump
+	dump, err := runCommand("objdump", "-d", t.Object, "--insn-width", "16")
+	if err != nil {
+		return err
+	}
+
+	// Parse object dump
+	if err := p.parseObjectDump(dump, assembly, t.TargetOS); err != nil {
+		return err
+	}
+
+	// Copy lines to functions
+	for i, fn := range functions {
+		if lines, ok := assembly[fn.Name]; ok {
+			functions[i].Lines = make([]interface{}, len(lines))
+			for j, line := range lines {
+				functions[i].Lines[j] = line
+			}
+		}
+		if sz, ok := stackSizes[fn.Name]; ok {
+			functions[i].StackSize = sz
+		}
+	}
+
+	// Generate Go assembly
+	return p.generateGoAssembly(t, functions)
+}
+
+func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]*amd64Line, map[string]int, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, nil, err
@@ -109,44 +184,42 @@ func parseAssembly(path string) (map[string][]Line, map[string]int, error) {
 
 	var (
 		stackSizes   = make(map[string]int)
-		functions    = make(map[string][]Line)
+		functions    = make(map[string][]*amd64Line)
 		functionName string
 		labelName    string
 	)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if attributeLine.MatchString(line) {
+		if amd64AttributeLine.MatchString(line) {
 			continue
-		} else if nameLine.MatchString(line) {
+		} else if amd64NameLine.MatchString(line) {
 			functionName = strings.Split(line, ":")[0]
 			// On macOS, function names are prefixed with underscore - strip it
-			if runtime.GOOS == "darwin" && strings.HasPrefix(functionName, "_") {
+			if targetOS == "darwin" && strings.HasPrefix(functionName, "_") {
 				functionName = functionName[1:]
 			}
-			functions[functionName] = make([]Line, 0)
+			functions[functionName] = make([]*amd64Line, 0)
 			labelName = ""
-		} else if labelLine.MatchString(line) {
+		} else if amd64LabelLine.MatchString(line) {
 			labelName = strings.Split(line, ":")[0]
 			labelName = labelName[1:]
 			lines := functions[functionName]
 			if len(lines) > 0 && lines[len(lines)-1].Assembly == "" {
-				// If the last line is a label, append the label to the last line.
 				lines[len(lines)-1].Labels = append(lines[len(lines)-1].Labels, labelName)
 			} else {
-				functions[functionName] = append(functions[functionName], Line{Labels: []string{labelName}})
+				functions[functionName] = append(functions[functionName], &amd64Line{Labels: []string{labelName}})
 			}
-		} else if codeLine.MatchString(line) {
-			asm := sanitizeAsm(line)
+		} else if amd64CodeLine.MatchString(line) {
+			asm := amd64SanitizeAsm(line)
 			if labelName == "" {
-				functions[functionName] = append(functions[functionName], Line{Assembly: asm})
+				functions[functionName] = append(functions[functionName], &amd64Line{Assembly: asm})
 			} else {
 				lines := functions[functionName]
 				if len(lines) == 0 {
-					functions[functionName] = append(functions[functionName], Line{Labels: []string{labelName}})
+					functions[functionName] = append(functions[functionName], &amd64Line{Labels: []string{labelName}})
 					lines = functions[functionName]
 				}
-
 				lines[len(lines)-1].Assembly = asm
 				labelName = ""
 			}
@@ -159,30 +232,29 @@ func parseAssembly(path string) (map[string][]Line, map[string]int, error) {
 	return functions, stackSizes, nil
 }
 
-func sanitizeAsm(asm string) string {
+func amd64SanitizeAsm(asm string) string {
 	asm = strings.TrimSpace(asm)
 	asm = strings.Split(asm, "//")[0]
 	asm = strings.TrimSpace(asm)
-
 	return asm
 }
 
-func parseObjectDump(dump string, functions map[string][]Line) error {
+func (p *AMD64Parser) parseObjectDump(dump string, functions map[string][]*amd64Line, targetOS string) error {
 	var (
 		functionName string
 		lineNumber   int
 	)
 	for i, line := range strings.Split(dump, "\n") {
 		line = strings.TrimSpace(line)
-		if symbolLine.MatchString(line) {
+		if amd64SymbolLine.MatchString(line) {
 			functionName = strings.Split(line, "<")[1]
 			functionName = strings.Split(functionName, ">")[0]
 			// On macOS, function names are prefixed with underscore - strip it
-			if runtime.GOOS == "darwin" && strings.HasPrefix(functionName, "_") {
+			if targetOS == "darwin" && strings.HasPrefix(functionName, "_") {
 				functionName = functionName[1:]
 			}
 			lineNumber = 0
-		} else if dataLine.MatchString(line) {
+		} else if amd64DataLine.MatchString(line) {
 			data := strings.Split(line, ":")[1]
 			data = strings.TrimSpace(data)
 			splits := strings.Split(data, " ")
@@ -199,7 +271,7 @@ func parseObjectDump(dump string, functions map[string][]Line) error {
 				binary = append(binary, s)
 			}
 
-			assembly = sanitizeAsm(assembly)
+			assembly = amd64SanitizeAsm(assembly)
 			if strings.Contains(assembly, "nop") {
 				continue
 			}
@@ -221,21 +293,21 @@ func parseObjectDump(dump string, functions map[string][]Line) error {
 	return nil
 }
 
-func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) error {
-	// generate code
+func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function) error {
 	var builder strings.Builder
-	builder.WriteString(buildTags)
+	builder.WriteString(p.BuildTags())
 	t.writeHeader(&builder)
+
 	for _, function := range functions {
 		// Calculate return size based on type
 		returnSize := 0
 		if function.Type != "void" {
 			if sz := X86SIMDTypeSize(function.Type); sz > 0 {
-				returnSize = sz // Use actual SIMD type size
+				returnSize = sz
 			} else if sz, ok := supportedTypes[function.Type]; ok {
-				returnSize = sz // Use actual scalar type size
+				returnSize = sz
 			} else {
-				returnSize = 8 // Default 8-byte slot for pointers/unknown types
+				returnSize = 8
 			}
 		}
 
@@ -244,33 +316,28 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 		var argsBuilder strings.Builder
 
 		for _, param := range function.Parameters {
-			// Calculate slot size based on type
-			sz := 8 // Default 8-byte slot for scalars in Go ABI0
+			sz := 8
 			if !param.Pointer {
 				if simdSz := X86SIMDTypeSize(param.Type); simdSz > 0 {
-					sz = simdSz // Use actual SIMD type size
+					sz = simdSz
 				}
 			}
 
-			// Align offset to slot size (max 16 for Go ABI0)
 			alignTo := sz
 			if alignTo > 16 {
-				alignTo = 16 // Cap alignment at 16 bytes for Go stack
+				alignTo = 16
 			}
 			if offset%alignTo != 0 {
 				offset += alignTo - offset%alignTo
 			}
 
 			if !param.Pointer && IsX86SIMDType(param.Type) {
-				// x86 SIMD vector type - load into XMM/YMM/ZMM register
-				if xmmRegisterIndex < len(xmmRegisters) {
+				if xmmRegisterIndex < len(amd64XMMRegisters) {
 					switch {
 					case X86SIMDTypeSize(param.Type) == 64:
-						// AVX-512 (512-bit): load into ZMM via 8 MOVQs
-						// Use _N suffixes (N=offset within param) so go vet accepts different offsets
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_0+%d(FP), AX\n", param.Name, offset))
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_8+%d(FP), BX\n", param.Name, offset+8))
-						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ AX, X14\n")) // temp
+						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ AX, X14\n"))
 						argsBuilder.WriteString(fmt.Sprintf("\tPINSRQ $1, BX, X14\n"))
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_16+%d(FP), AX\n", param.Name, offset+16))
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_24+%d(FP), BX\n", param.Name, offset+24))
@@ -286,10 +353,8 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ AX, X13\n"))
 						argsBuilder.WriteString(fmt.Sprintf("\tPINSRQ $1, BX, X13\n"))
 						argsBuilder.WriteString(fmt.Sprintf("\tVINSERTF128 $1, X13, Y15, Y15\n"))
-						argsBuilder.WriteString(fmt.Sprintf("\tVINSERTF64X4 $1, Y15, Z14, %s\n", zmmRegisters[xmmRegisterIndex]))
+						argsBuilder.WriteString(fmt.Sprintf("\tVINSERTF64X4 $1, Y15, Z14, %s\n", amd64ZMMRegisters[xmmRegisterIndex]))
 					case X86SIMDTypeSize(param.Type) == 32:
-						// AVX (256-bit): load into YMM via 4 MOVQs + VINSERTF128
-						// Use _N suffixes (N=offset within param) so go vet accepts different offsets
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_0+%d(FP), AX\n", param.Name, offset))
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_8+%d(FP), BX\n", param.Name, offset+8))
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ AX, X14\n"))
@@ -298,33 +363,31 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_24+%d(FP), BX\n", param.Name, offset+24))
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ AX, X15\n"))
 						argsBuilder.WriteString(fmt.Sprintf("\tPINSRQ $1, BX, X15\n"))
-						argsBuilder.WriteString(fmt.Sprintf("\tVINSERTF128 $1, X15, Y14, %s\n", ymmRegisters[xmmRegisterIndex]))
+						argsBuilder.WriteString(fmt.Sprintf("\tVINSERTF128 $1, X15, Y14, %s\n", amd64YMMRegisters[xmmRegisterIndex]))
 					default:
-						// SSE (128-bit): load into XMM via 2 MOVQs + PINSRQ
-						// Use _N suffixes (N=offset within param) so go vet accepts different offsets
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_0+%d(FP), AX\n", param.Name, offset))
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_8+%d(FP), BX\n", param.Name, offset+8))
-						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ AX, %s\n", xmmRegisters[xmmRegisterIndex]))
-						argsBuilder.WriteString(fmt.Sprintf("\tPINSRQ $1, BX, %s\n", xmmRegisters[xmmRegisterIndex]))
+						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ AX, %s\n", amd64XMMRegisters[xmmRegisterIndex]))
+						argsBuilder.WriteString(fmt.Sprintf("\tPINSRQ $1, BX, %s\n", amd64XMMRegisters[xmmRegisterIndex]))
 					}
 					xmmRegisterIndex++
 				} else {
 					stack = append(stack, lo.Tuple2[int, Parameter]{A: offset, B: param})
 				}
 			} else if !param.Pointer && (param.Type == "double" || param.Type == "float") {
-				if xmmRegisterIndex < len(xmmRegisters) {
+				if xmmRegisterIndex < len(amd64XMMRegisters) {
 					if param.Type == "double" {
-						argsBuilder.WriteString(fmt.Sprintf("\tMOVSD %s+%d(FP), %s\n", param.Name, offset, xmmRegisters[xmmRegisterIndex]))
+						argsBuilder.WriteString(fmt.Sprintf("\tMOVSD %s+%d(FP), %s\n", param.Name, offset, amd64XMMRegisters[xmmRegisterIndex]))
 					} else {
-						argsBuilder.WriteString(fmt.Sprintf("\tMOVSS %s+%d(FP), %s\n", param.Name, offset, xmmRegisters[xmmRegisterIndex]))
+						argsBuilder.WriteString(fmt.Sprintf("\tMOVSS %s+%d(FP), %s\n", param.Name, offset, amd64XMMRegisters[xmmRegisterIndex]))
 					}
 					xmmRegisterIndex++
 				} else {
 					stack = append(stack, lo.Tuple2[int, Parameter]{A: offset, B: param})
 				}
 			} else {
-				if registerIndex < len(registers) {
-					argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s+%d(FP), %s\n", param.Name, offset, registers[registerIndex]))
+				if registerIndex < len(amd64Registers) {
+					argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s+%d(FP), %s\n", param.Name, offset, amd64Registers[registerIndex]))
 					registerIndex++
 				} else {
 					stack = append(stack, lo.Tuple2[int, Parameter]{A: offset, B: param})
@@ -333,7 +396,6 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 			offset += sz
 		}
 
-		// Check if SIMD types are used (for stack frame alignment)
 		hasSIMD := false
 		for _, param := range function.Parameters {
 			if !param.Pointer && IsX86SIMDType(param.Type) {
@@ -344,10 +406,7 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 		if !hasSIMD && IsX86SIMDType(function.Type) {
 			hasSIMD = true
 		}
-		// Note: Don't align offset to 16 bytes here - Go's ABI only requires 8-byte
-		// alignment for return values
 
-		// Calculate stack frame size (for spilled parameters)
 		stackOffset := 0
 		if len(stack) > 0 {
 			for i := 0; i < len(stack); i++ {
@@ -360,7 +419,6 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 				}
 			}
 		}
-		// Align stack frame
 		if hasSIMD && stackOffset%16 != 0 {
 			stackOffset += 16 - stackOffset%16
 		}
@@ -369,7 +427,6 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 			function.Name, stackOffset, offset+returnSize))
 		builder.WriteString(argsBuilder.String())
 
-		// Push stack parameters if needed
 		if len(stack) > 0 {
 			for i := len(stack) - 1; i >= 0; i-- {
 				builder.WriteString(fmt.Sprintf("\tPUSHQ %s+%d(FP)\n", stack[i].B.Name, stack[i].A))
@@ -377,7 +434,12 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 			builder.WriteString("\tPUSHQ $0\n")
 		}
 
-		for _, line := range function.Lines {
+		// Convert interface{} lines back to amd64Line
+		for _, lineIface := range function.Lines {
+			line, ok := lineIface.(*amd64Line)
+			if !ok {
+				continue
+			}
 			for _, label := range line.Labels {
 				builder.WriteString(label)
 				builder.WriteString(":\n")
@@ -397,13 +459,10 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 					case "float":
 						builder.WriteString(fmt.Sprintf("\tMOVSS X0, result+%d(FP)\n", offset))
 					default:
-						// Check for x86 SIMD vector return types
 						if IsX86SIMDType(function.Type) {
 							resultOffset := offset
 							switch X86SIMDTypeSize(function.Type) {
 							case 64:
-								// AVX-512 (512-bit): extract from ZMM0 via stores
-								// Use _N suffixes (N=offset within result) so go vet accepts different offsets
 								builder.WriteString("\tVEXTRACTF64X4 $0, Z0, Y14\n")
 								builder.WriteString("\tVEXTRACTF64X4 $1, Z0, Y15\n")
 								builder.WriteString("\tVEXTRACTF128 $0, Y14, X14\n")
@@ -427,8 +486,6 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 								builder.WriteString(fmt.Sprintf("\tMOVQ AX, result_48+%d(FP)\n", resultOffset+48))
 								builder.WriteString(fmt.Sprintf("\tMOVQ BX, result_56+%d(FP)\n", resultOffset+56))
 							case 32:
-								// AVX (256-bit): extract from YMM0 via VEXTRACTF128 + MOVQ/PEXTRQ
-								// Use _N suffixes (N=offset within result) so go vet accepts different offsets
 								builder.WriteString("\tVEXTRACTF128 $0, Y0, X14\n")
 								builder.WriteString("\tMOVQ X14, AX\n")
 								builder.WriteString("\tPEXTRQ $1, X14, BX\n")
@@ -440,8 +497,6 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 								builder.WriteString(fmt.Sprintf("\tMOVQ AX, result_16+%d(FP)\n", resultOffset+16))
 								builder.WriteString(fmt.Sprintf("\tMOVQ BX, result_24+%d(FP)\n", resultOffset+24))
 							case 16:
-								// SSE (128-bit): extract from XMM0 via MOVQ + PEXTRQ
-								// Use _N suffixes (N=offset within result) so go vet accepts different offsets
 								builder.WriteString("\tMOVQ X0, AX\n")
 								builder.WriteString("\tPEXTRQ $1, X0, BX\n")
 								builder.WriteString(fmt.Sprintf("\tMOVQ AX, result_0+%d(FP)\n", resultOffset))
@@ -459,8 +514,8 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 		}
 	}
 
-	// write file
-	f, err := os.Create(path)
+	// Write file
+	f, err := os.Create(t.GoAssembly)
 	if err != nil {
 		return err
 	}
@@ -476,4 +531,8 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 	}
 	_, err = f.Write(bytes)
 	return err
+}
+
+func init() {
+	RegisterParser("amd64", &AMD64Parser{})
 }

@@ -328,12 +328,21 @@ type TranslateUnit struct {
 	Package    string
 	Options    []string
 	Offset     int
+	Target     string     // Target architecture (amd64, arm64, etc.)
+	TargetOS   string     // Target OS (darwin, linux, etc.)
+	parser     ArchParser // Architecture-specific parser
 }
 
-func NewTranslateUnit(source string, outputDir string, options ...string) TranslateUnit {
+func NewTranslateUnit(source string, outputDir string, target string, targetOS string, options ...string) (TranslateUnit, error) {
 	sourceExt := filepath.Ext(source)
 	noExtSourcePath := source[:len(source)-len(sourceExt)]
 	noExtSourceBase := filepath.Base(noExtSourcePath)
+
+	parser, err := GetParser(target)
+	if err != nil {
+		return TranslateUnit{}, err
+	}
+
 	return TranslateUnit{
 		Source:     source,
 		Assembly:   noExtSourcePath + ".s",
@@ -342,7 +351,10 @@ func NewTranslateUnit(source string, outputDir string, options ...string) Transl
 		Go:         filepath.Join(outputDir, noExtSourceBase+".go"),
 		Package:    filepath.Base(outputDir),
 		Options:    options,
-	}
+		Target:     target,
+		TargetOS:   targetOS,
+		parser:     parser,
+	}, nil
 }
 
 // parseSource parse C source file and extract functions declarations.
@@ -351,12 +363,13 @@ func (t *TranslateUnit) parseSource() ([]Function, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := cc.NewConfig(runtime.GOOS, runtime.GOARCH)
+	cfg, err := cc.NewConfig(t.TargetOS, t.Target)
 	if err != nil {
 		return nil, err
 	}
 	var prologue strings.Builder
-	if cpu.RISCV64.HasV {
+	// Add RISC-V vector support if available
+	if t.Target == "riscv64" && cpu.RISCV64.HasV {
 		prologue.WriteString("#define __riscv_vector 1\n")
 		for _, typeStr := range []string{"int64", "uint64", "int32", "uint32", "int16", "uint16", "int8", "uint8", "float64", "float32", "float16"} {
 			for i := 1; i <= 8; i *= 2 {
@@ -364,30 +377,8 @@ func (t *TranslateUnit) parseSource() ([]Function, error) {
 			}
 		}
 	}
-	// Add definitions for ARM64 to help parser handle arm_neon.h
-	if runtime.GOARCH == "arm64" {
-		// Define __bf16 for arm_bf16.h (compiler built-in type)
-		prologue.WriteString("typedef short __bf16;\n")
-		// Define __fp16 for arm_fp16.h
-		prologue.WriteString("typedef short __fp16;\n")
-	}
-	// Add definitions for AMD64 to help parser handle x86 intrinsics
-	if runtime.GOARCH == "amd64" {
-		// Define GOAT_PARSER to skip includes during parsing
-		// The C file should use: #ifndef GOAT_PARSER / #include <immintrin.h> / #endif
-		prologue.WriteString("#define GOAT_PARSER 1\n")
-		// Define x86 SIMD types as opaque structs for the parser
-		// The actual types are compiler built-ins, but we just need names for parsing
-		prologue.WriteString("typedef struct { char _[16]; } __m128;\n")
-		prologue.WriteString("typedef struct { char _[16]; } __m128d;\n")
-		prologue.WriteString("typedef struct { char _[16]; } __m128i;\n")
-		prologue.WriteString("typedef struct { char _[32]; } __m256;\n")
-		prologue.WriteString("typedef struct { char _[32]; } __m256d;\n")
-		prologue.WriteString("typedef struct { char _[32]; } __m256i;\n")
-		prologue.WriteString("typedef struct { char _[64]; } __m512;\n")
-		prologue.WriteString("typedef struct { char _[64]; } __m512d;\n")
-		prologue.WriteString("typedef struct { char _[64]; } __m512i;\n")
-	}
+	// Add architecture-specific prologue from parser
+	prologue.WriteString(t.parser.Prologue())
 	ast, err := cc.Parse(cfg, []cc.Source{
 		{Name: "<predefined>", Value: cfg.Predefined},
 		{Name: "<builtin>", Value: cc.Builtin},
@@ -422,7 +413,7 @@ func (t *TranslateUnit) parseSource() ([]Function, error) {
 func (t *TranslateUnit) generateGoStubs(functions []Function) error {
 	// generate code
 	var builder strings.Builder
-	builder.WriteString(buildTags)
+	builder.WriteString(t.parser.BuildTags())
 	t.writeHeader(&builder)
 	builder.WriteString(fmt.Sprintf("package %v\n", t.Package))
 	if hasPointer(functions) {
@@ -488,19 +479,15 @@ func (t *TranslateUnit) compile(args ...string) error {
 	args = append(args, "-mno-red-zone", "-mllvm", "-inline-threshold=1000",
 		"-fno-asynchronous-unwind-tables", "-fno-exceptions", "-fno-rtti", "-fno-builtin",
 		"-fomit-frame-pointer")
-	if runtime.GOARCH == "arm64" {
-		// R18 is the "platform register", reserved on the Apple platform.
-		// See https://go.dev/doc/asm#arm64
-		args = append(args, "-ffixed-x18")
-	} else if runtime.GOARCH == "riscv64" {
-		// X27 points to the Go routine structure.
-		args = append(args, "-ffixed-x27")
-	}
-	_, err := runCommand("clang", append([]string{"-S", "-target", buildTarget, "-c", t.Source, "-o", t.Assembly}, args...)...)
+	// Add architecture-specific compiler flags
+	args = append(args, t.parser.CompilerFlags()...)
+
+	target := t.parser.BuildTarget(t.TargetOS)
+	_, err := runCommand("clang", append([]string{"-S", "-target", target, "-c", t.Source, "-o", t.Assembly}, args...)...)
 	if err != nil {
 		return err
 	}
-	_, err = runCommand("clang", append([]string{"-target", buildTarget, "-c", t.Assembly, "-o", t.Object}, args...)...)
+	_, err = runCommand("clang", append([]string{"-target", target, "-c", t.Assembly, "-o", t.Object}, args...)...)
 	return err
 }
 
@@ -515,23 +502,8 @@ func (t *TranslateUnit) Translate() error {
 	if err = t.compile(t.Options...); err != nil {
 		return err
 	}
-	assembly, stackSizes, err := parseAssembly(t.Assembly)
-	if err != nil {
-		return err
-	}
-	dump, err := runCommand("objdump", "-d", t.Object, "--insn-width", "16")
-	if err != nil {
-		return err
-	}
-	err = parseObjectDump(dump, assembly)
-	if err != nil {
-		return err
-	}
-	for i, name := range functions {
-		functions[i].Lines = assembly[name.Name]
-		functions[i].StackSize = stackSizes[name.Name]
-	}
-	return t.generateGoAssembly(t.GoAssembly, functions)
+	// Use architecture-specific parser for assembly translation
+	return t.parser.TranslateAssembly(t, functions)
 }
 
 type ParameterType struct {
@@ -579,7 +551,7 @@ type Function struct {
 	Position   int
 	Type       string
 	Parameters []Parameter
-	Lines      []Line
+	Lines      []interface{} // Architecture-specific line types stored as interface{}
 	StackSize  int
 }
 
@@ -714,6 +686,9 @@ var command = &cobra.Command{
 				os.Exit(1)
 			}
 		}
+		target, _ := cmd.PersistentFlags().GetString("target")
+		targetOS, _ := cmd.PersistentFlags().GetString("target-os")
+
 		var options []string
 		machineOptions, _ := cmd.PersistentFlags().GetStringSlice("machine-option")
 		for _, m := range machineOptions {
@@ -723,7 +698,11 @@ var command = &cobra.Command{
 		options = append(options, extraOptions...)
 		optimizeLevel, _ := cmd.PersistentFlags().GetInt("optimize-level")
 		options = append(options, fmt.Sprintf("-O%d", optimizeLevel))
-		file := NewTranslateUnit(args[0], output, options...)
+		file, err := NewTranslateUnit(args[0], output, target, targetOS, options...)
+		if err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 		if err := file.Translate(); err != nil {
 			_, _ = fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -737,6 +716,8 @@ func init() {
 	command.PersistentFlags().StringSliceP("extra-option", "e", nil, "extra option for clang")
 	command.PersistentFlags().IntP("optimize-level", "O", 0, "optimization level for clang")
 	command.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "if set, increase verbosity level")
+	command.PersistentFlags().StringP("target", "t", runtime.GOARCH, "target architecture (amd64, arm64, loong64, riscv64)")
+	command.PersistentFlags().String("target-os", runtime.GOOS, "target operating system (darwin, linux, windows)")
 }
 
 func main() {

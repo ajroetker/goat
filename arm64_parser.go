@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 package main
 
 import (
@@ -25,36 +26,38 @@ import (
 	"github.com/samber/lo"
 )
 
-const (
-	buildTags   = "//go:build !noasm && arm64\n"
-	buildTarget = "arm64-linux-gnu"
-)
+// ARM64Parser implements ArchParser for ARM64/NEON architecture
+type ARM64Parser struct{}
 
+// arm64 regex patterns
 var (
-	attributeLine = regexp.MustCompile(`^\s+\..+$`)
-	nameLine      = regexp.MustCompile(`^\w+:.+$`)
-	labelLine     = regexp.MustCompile(`^\.\w+_\d+:.*$`)
-	codeLine      = regexp.MustCompile(`^\s+\w+.+$`)
-	jmpLine       = regexp.MustCompile(`^(b|b\.\w{2})\t\.\w+_\d+$`)
-
-	symbolLine = regexp.MustCompile(`^\w+\s+<\w+>:$`)
-	dataLine   = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
-
-	registers   = []string{"R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7"}
-	fpRegisters = []string{"F0", "F1", "F2", "F3", "F4", "F5", "F6", "F7"}
-	// NEON 128-bit vector registers (V0-V7 for parameter passing per ARM64 ABI)
-	neonRegisters = []string{"V0", "V1", "V2", "V3", "V4", "V5", "V6", "V7"}
+	arm64AttributeLine = regexp.MustCompile(`^\s+\..+$`)
+	arm64NameLine      = regexp.MustCompile(`^\w+:.+$`)
+	arm64LabelLine     = regexp.MustCompile(`^\.\w+_\d+:.*$`)
+	arm64CodeLine      = regexp.MustCompile(`^\s+\w+.+$`)
+	arm64JmpLine       = regexp.MustCompile(`^(b|b\.\w{2})\t\.\w+_\d+$`)
+	arm64SymbolLine    = regexp.MustCompile(`^\w+\s+<\w+>:$`)
+	arm64DataLine      = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
 )
 
-type Line struct {
+// arm64 register sets
+var (
+	arm64Registers     = []string{"R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7"}
+	arm64FPRegisters   = []string{"F0", "F1", "F2", "F3", "F4", "F5", "F6", "F7"}
+	arm64NeonRegisters = []string{"V0", "V1", "V2", "V3", "V4", "V5", "V6", "V7"}
+)
+
+// arm64Line represents a single assembly instruction for ARM64
+// Binary is string because ARM64 has fixed-width 32-bit instructions
+type arm64Line struct {
 	Labels   []string
 	Assembly string
 	Binary   string
 }
 
-func (line *Line) String() string {
+func (line *arm64Line) String() string {
 	var builder strings.Builder
-	if jmpLine.MatchString(line.Assembly) {
+	if arm64JmpLine.MatchString(line.Assembly) {
 		splits := strings.Split(line.Assembly, "\t")
 		instruction := strings.Map(func(r rune) rune {
 			if r == '.' {
@@ -74,7 +77,136 @@ func (line *Line) String() string {
 	return builder.String()
 }
 
-func parseAssembly(path string) (map[string][]Line, map[string]int, error) {
+// Name returns the architecture name
+func (p *ARM64Parser) Name() string {
+	return "arm64"
+}
+
+// BuildTags returns the Go build constraint
+func (p *ARM64Parser) BuildTags() string {
+	return "//go:build !noasm && arm64\n"
+}
+
+// BuildTarget returns the clang target triple
+func (p *ARM64Parser) BuildTarget(goos string) string {
+	if goos == "darwin" {
+		return "arm64-apple-darwin"
+	}
+	return "arm64-linux-gnu"
+}
+
+// CompilerFlags returns architecture-specific compiler flags
+func (p *ARM64Parser) CompilerFlags() []string {
+	// ARM64 requires x18 to be reserved (platform register on some OSes)
+	return []string{"-ffixed-x18"}
+}
+
+// Prologue returns C parser prologue for ARM64 NEON types
+func (p *ARM64Parser) Prologue() string {
+	var prologue strings.Builder
+	// Define GOAT_PARSER to skip includes during parsing
+	prologue.WriteString("#define GOAT_PARSER 1\n")
+
+	// Define __bf16 for arm_bf16.h (compiler built-in type)
+	prologue.WriteString("typedef short __bf16;\n")
+	// Define __fp16 for arm_fp16.h
+	prologue.WriteString("typedef short __fp16;\n")
+
+	// Define NEON 64-bit vector types
+	prologue.WriteString("typedef struct { char _[8]; } int8x8_t;\n")
+	prologue.WriteString("typedef struct { char _[8]; } int16x4_t;\n")
+	prologue.WriteString("typedef struct { char _[8]; } int32x2_t;\n")
+	prologue.WriteString("typedef struct { char _[8]; } int64x1_t;\n")
+	prologue.WriteString("typedef struct { char _[8]; } uint8x8_t;\n")
+	prologue.WriteString("typedef struct { char _[8]; } uint16x4_t;\n")
+	prologue.WriteString("typedef struct { char _[8]; } uint32x2_t;\n")
+	prologue.WriteString("typedef struct { char _[8]; } uint64x1_t;\n")
+	prologue.WriteString("typedef struct { char _[8]; } float32x2_t;\n")
+	prologue.WriteString("typedef struct { char _[8]; } float64x1_t;\n")
+	prologue.WriteString("typedef struct { char _[8]; } float16x4_t;\n")
+	prologue.WriteString("typedef struct { char _[8]; } bfloat16x4_t;\n")
+	prologue.WriteString("typedef struct { char _[8]; } poly8x8_t;\n")
+	prologue.WriteString("typedef struct { char _[8]; } poly16x4_t;\n")
+	prologue.WriteString("typedef struct { char _[8]; } poly64x1_t;\n")
+
+	// Define NEON 128-bit vector types
+	prologue.WriteString("typedef struct { char _[16]; } int8x16_t;\n")
+	prologue.WriteString("typedef struct { char _[16]; } int16x8_t;\n")
+	prologue.WriteString("typedef struct { char _[16]; } int32x4_t;\n")
+	prologue.WriteString("typedef struct { char _[16]; } int64x2_t;\n")
+	prologue.WriteString("typedef struct { char _[16]; } uint8x16_t;\n")
+	prologue.WriteString("typedef struct { char _[16]; } uint16x8_t;\n")
+	prologue.WriteString("typedef struct { char _[16]; } uint32x4_t;\n")
+	prologue.WriteString("typedef struct { char _[16]; } uint64x2_t;\n")
+	prologue.WriteString("typedef struct { char _[16]; } float32x4_t;\n")
+	prologue.WriteString("typedef struct { char _[16]; } float64x2_t;\n")
+	prologue.WriteString("typedef struct { char _[16]; } float16x8_t;\n")
+	prologue.WriteString("typedef struct { char _[16]; } bfloat16x8_t;\n")
+	prologue.WriteString("typedef struct { char _[16]; } poly8x16_t;\n")
+	prologue.WriteString("typedef struct { char _[16]; } poly16x8_t;\n")
+	prologue.WriteString("typedef struct { char _[16]; } poly64x2_t;\n")
+	prologue.WriteString("typedef struct { char _[16]; } poly128_t;\n")
+
+	// Define NEON 128-bit array types (x2, x3, x4)
+	for _, base := range []string{"int8x16", "int16x8", "int32x4", "int64x2",
+		"uint8x16", "uint16x8", "uint32x4", "uint64x2",
+		"float32x4", "float64x2", "float16x8", "bfloat16x8",
+		"poly8x16", "poly16x8", "poly64x2"} {
+		prologue.WriteString(fmt.Sprintf("typedef struct { char _[32]; } %sx2_t;\n", base))
+		prologue.WriteString(fmt.Sprintf("typedef struct { char _[48]; } %sx3_t;\n", base))
+		prologue.WriteString(fmt.Sprintf("typedef struct { char _[64]; } %sx4_t;\n", base))
+	}
+
+	// Define NEON 64-bit array types (x2, x3, x4)
+	for _, base := range []string{"int8x8", "int16x4", "int32x2", "int64x1",
+		"uint8x8", "uint16x4", "uint32x2", "uint64x1",
+		"float32x2", "float64x1", "float16x4", "bfloat16x4",
+		"poly8x8", "poly16x4", "poly64x1"} {
+		prologue.WriteString(fmt.Sprintf("typedef struct { char _[16]; } %sx2_t;\n", base))
+		prologue.WriteString(fmt.Sprintf("typedef struct { char _[24]; } %sx3_t;\n", base))
+		prologue.WriteString(fmt.Sprintf("typedef struct { char _[32]; } %sx4_t;\n", base))
+	}
+
+	return prologue.String()
+}
+
+// TranslateAssembly implements the full translation pipeline for ARM64
+func (p *ARM64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) error {
+	// Parse assembly
+	assembly, stackSizes, err := p.parseAssembly(t.Assembly, t.TargetOS)
+	if err != nil {
+		return err
+	}
+
+	// Run objdump
+	dump, err := runCommand("objdump", "-d", t.Object)
+	if err != nil {
+		return err
+	}
+
+	// Parse object dump
+	if err := p.parseObjectDump(dump, assembly, t.TargetOS); err != nil {
+		return err
+	}
+
+	// Copy lines to functions
+	for i, fn := range functions {
+		if lines, ok := assembly[fn.Name]; ok {
+			functions[i].Lines = make([]interface{}, len(lines))
+			for j, line := range lines {
+				functions[i].Lines[j] = line
+			}
+		}
+		if sz, ok := stackSizes[fn.Name]; ok {
+			functions[i].StackSize = sz
+		}
+	}
+
+	// Generate Go assembly
+	return p.generateGoAssembly(t, functions)
+}
+
+func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]*arm64Line, map[string]int, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, nil, err
@@ -88,32 +220,37 @@ func parseAssembly(path string) (map[string][]Line, map[string]int, error) {
 
 	var (
 		stackSizes   = make(map[string]int)
-		functions    = make(map[string][]Line)
+		functions    = make(map[string][]*arm64Line)
 		functionName string
 		labelName    string
 	)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
-		if attributeLine.MatchString(line) {
+		if arm64AttributeLine.MatchString(line) {
 			continue
-		} else if nameLine.MatchString(line) {
+		} else if arm64NameLine.MatchString(line) {
 			functionName = strings.Split(line, ":")[0]
-			functions[functionName] = make([]Line, 0)
-		} else if labelLine.MatchString(line) {
+			// On macOS, function names are prefixed with underscore - strip it
+			if targetOS == "darwin" && strings.HasPrefix(functionName, "_") {
+				functionName = functionName[1:]
+			}
+			functions[functionName] = make([]*arm64Line, 0)
+			labelName = ""
+		} else if arm64LabelLine.MatchString(line) {
 			labelName = strings.Split(line, ":")[0]
 			labelName = labelName[1:]
 			lines := functions[functionName]
 			if len(lines) == 1 || lines[len(lines)-1].Assembly != "" {
-				functions[functionName] = append(functions[functionName], Line{Labels: []string{labelName}})
+				functions[functionName] = append(functions[functionName], &arm64Line{Labels: []string{labelName}})
 			} else {
 				lines[len(lines)-1].Labels = append(lines[len(lines)-1].Labels, labelName)
 			}
-		} else if codeLine.MatchString(line) {
+		} else if arm64CodeLine.MatchString(line) {
 			asm := strings.Split(line, "//")[0]
 			asm = strings.TrimSpace(asm)
 			if labelName == "" {
-				functions[functionName] = append(functions[functionName], Line{Assembly: asm})
+				functions[functionName] = append(functions[functionName], &arm64Line{Assembly: asm})
 			} else {
 				lines := functions[functionName]
 				if len(lines) > 0 {
@@ -130,18 +267,22 @@ func parseAssembly(path string) (map[string][]Line, map[string]int, error) {
 	return functions, stackSizes, nil
 }
 
-func parseObjectDump(dump string, functions map[string][]Line) error {
+func (p *ARM64Parser) parseObjectDump(dump string, functions map[string][]*arm64Line, targetOS string) error {
 	var (
 		functionName string
 		lineNumber   int
 	)
 	for i, line := range strings.Split(dump, "\n") {
 		line = strings.TrimSpace(line)
-		if symbolLine.MatchString(line) {
+		if arm64SymbolLine.MatchString(line) {
 			functionName = strings.Split(line, "<")[1]
 			functionName = strings.Split(functionName, ">")[0]
+			// On macOS, function names are prefixed with underscore - strip it
+			if targetOS == "darwin" && strings.HasPrefix(functionName, "_") {
+				functionName = functionName[1:]
+			}
 			lineNumber = 0
-		} else if dataLine.MatchString(line) {
+		} else if arm64DataLine.MatchString(line) {
 			data := strings.Split(line, ":")[1]
 			data = strings.TrimSpace(data)
 			splits := strings.Split(data, " ")
@@ -167,11 +308,11 @@ func parseObjectDump(dump string, functions map[string][]Line) error {
 	return nil
 }
 
-func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) error {
-	// generate code
+func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function) error {
 	var builder strings.Builder
-	builder.WriteString(buildTags)
+	builder.WriteString(p.BuildTags())
 	t.writeHeader(&builder)
+
 	for _, function := range functions {
 		// Calculate return size based on type
 		returnSize := 0
@@ -184,9 +325,11 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 				returnSize = 8 // Default 8-byte slot for pointers/unknown types
 			}
 		}
+
 		registerCount, fpRegisterCount, neonRegisterCount, offset := 0, 0, 0, 0
 		var stack []lo.Tuple2[int, Parameter]
 		var argsBuilder strings.Builder
+
 		for _, param := range function.Parameters {
 			// Calculate slot size based on type
 			sz := 8 // Default 8-byte slot
@@ -199,8 +342,8 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 						alignTo = 16 // Cap alignment at 16 bytes
 					}
 				} else if param.Type == "float" {
-					sz = 4       // float32 is 4 bytes
-					alignTo = 4  // 4-byte alignment
+					sz = 4      // float32 is 4 bytes
+					alignTo = 4 // 4-byte alignment
 				}
 				// double, int64_t, long, pointers use default 8 bytes
 			}
@@ -208,12 +351,13 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 			if offset%alignTo != 0 {
 				offset += alignTo - offset%alignTo
 			}
+
 			if !param.Pointer && IsNeonType(param.Type) {
 				// NEON vector type - load into V register(s)
 				vecCount := NeonVectorCount(param.Type)
 				is64bit := IsNeon64Type(param.Type)
 
-				if neonRegisterCount+vecCount <= len(neonRegisters) {
+				if neonRegisterCount+vecCount <= len(arm64NeonRegisters) {
 					for v := 0; v < vecCount; v++ {
 						vecOffset := offset + v*16
 						if is64bit {
@@ -223,15 +367,15 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 						if is64bit {
 							// 64-bit vector: single MOVD, load into D[0] only
 							argsBuilder.WriteString(fmt.Sprintf("\tMOVD %s+%d(FP), R9\n", param.Name, vecOffset))
-							argsBuilder.WriteString(fmt.Sprintf("\tVMOV R9, %s.D[0]\n", neonRegisters[neonRegisterCount+v]))
+							argsBuilder.WriteString(fmt.Sprintf("\tVMOV R9, %s.D[0]\n", arm64NeonRegisters[neonRegisterCount+v]))
 						} else {
 							// 128-bit vector: two MOVDs, load into D[0] and D[1]
 							// Use _N suffixes (N=offset within param) so go vet accepts different offsets
 							localOffset := v * 16 // offset within this parameter's storage
 							argsBuilder.WriteString(fmt.Sprintf("\tMOVD %s_%d+%d(FP), R9\n", param.Name, localOffset, vecOffset))
 							argsBuilder.WriteString(fmt.Sprintf("\tMOVD %s_%d+%d(FP), R10\n", param.Name, localOffset+8, vecOffset+8))
-							argsBuilder.WriteString(fmt.Sprintf("\tVMOV R9, %s.D[0]\n", neonRegisters[neonRegisterCount+v]))
-							argsBuilder.WriteString(fmt.Sprintf("\tVMOV R10, %s.D[1]\n", neonRegisters[neonRegisterCount+v]))
+							argsBuilder.WriteString(fmt.Sprintf("\tVMOV R9, %s.D[0]\n", arm64NeonRegisters[neonRegisterCount+v]))
+							argsBuilder.WriteString(fmt.Sprintf("\tVMOV R10, %s.D[1]\n", arm64NeonRegisters[neonRegisterCount+v]))
 						}
 					}
 					neonRegisterCount += vecCount
@@ -239,19 +383,19 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 					stack = append(stack, lo.Tuple2[int, Parameter]{A: offset, B: param})
 				}
 			} else if !param.Pointer && (param.Type == "float" || param.Type == "double") {
-				if fpRegisterCount < len(fpRegisters) {
+				if fpRegisterCount < len(arm64FPRegisters) {
 					if param.Type == "float" {
-						argsBuilder.WriteString(fmt.Sprintf("\tFMOVS %s+%d(FP), %s\n", param.Name, offset, fpRegisters[fpRegisterCount]))
+						argsBuilder.WriteString(fmt.Sprintf("\tFMOVS %s+%d(FP), %s\n", param.Name, offset, arm64FPRegisters[fpRegisterCount]))
 					} else {
-						argsBuilder.WriteString(fmt.Sprintf("\tFMOVD %s+%d(FP), %s\n", param.Name, offset, fpRegisters[fpRegisterCount]))
+						argsBuilder.WriteString(fmt.Sprintf("\tFMOVD %s+%d(FP), %s\n", param.Name, offset, arm64FPRegisters[fpRegisterCount]))
 					}
 					fpRegisterCount++
 				} else {
 					stack = append(stack, lo.Tuple2[int, Parameter]{A: offset, B: param})
 				}
 			} else {
-				if registerCount < len(registers) {
-					argsBuilder.WriteString(fmt.Sprintf("\tMOVD %s+%d(FP), %s\n", param.Name, offset, registers[registerCount]))
+				if registerCount < len(arm64Registers) {
+					argsBuilder.WriteString(fmt.Sprintf("\tMOVD %s+%d(FP), %s\n", param.Name, offset, arm64Registers[registerCount]))
 					registerCount++
 				} else {
 					stack = append(stack, lo.Tuple2[int, Parameter]{A: offset, B: param})
@@ -259,7 +403,8 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 			}
 			offset += sz
 		}
-		// Check if 128-bit+ NEON types are used (for stack frame alignment)
+
+		// Align to 16 bytes only if 128-bit+ NEON types are used (not 64-bit)
 		has128BitNeon := false
 		for _, param := range function.Parameters {
 			if !param.Pointer && IsNeonType(param.Type) && !IsNeon64Type(param.Type) {
@@ -270,8 +415,10 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 		if !has128BitNeon && IsNeonType(function.Type) && !IsNeon64Type(function.Type) {
 			has128BitNeon = true
 		}
-		// Note: Don't align offset to 16 bytes here - Go's ABI only requires 8-byte
-		// alignment for return values, which is handled below
+		if has128BitNeon && offset%16 != 0 {
+			offset += 16 - offset%16
+		}
+
 		stackOffset := 0
 		if len(stack) > 0 {
 			for i := 0; i < len(stack); i++ {
@@ -280,7 +427,7 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 					is64bit := IsNeon64Type(stack[i].B.Type)
 					vecCount := NeonVectorCount(stack[i].B.Type)
 					for v := 0; v < vecCount; v++ {
-						srcOffset := stack[i].A + v*(16)
+						srcOffset := stack[i].A + v*16
 						if is64bit {
 							srcOffset = stack[i].A + v*8
 						}
@@ -311,18 +458,27 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 				}
 			}
 		}
+
 		// Align to 16 bytes only if 128-bit+ NEON types are used
 		if has128BitNeon && stackOffset%16 != 0 {
 			stackOffset += 16 - stackOffset%16
 		}
+
 		// Return value must be 8-byte aligned in Go's ABI
 		if offset%8 != 0 {
 			offset += 8 - offset%8
 		}
+
 		builder.WriteString(fmt.Sprintf("\nTEXT ·%v(SB), $%d-%d\n",
 			function.Name, stackOffset, offset+returnSize))
 		builder.WriteString(argsBuilder.String())
-		for _, line := range function.Lines {
+
+		// Convert interface{} lines back to arm64Line
+		for _, lineIface := range function.Lines {
+			line, ok := lineIface.(*arm64Line)
+			if !ok {
+				continue
+			}
 			for _, label := range line.Labels {
 				builder.WriteString(label)
 				builder.WriteString(":\n")
@@ -343,7 +499,7 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 							vecCount := NeonVectorCount(function.Type)
 							resultOffset := offset
 							for v := 0; v < vecCount; v++ {
-								vReg := neonRegisters[v] // V0, V1, V2, V3...
+								vReg := arm64NeonRegisters[v] // V0, V1, V2, V3...
 								if is64bit {
 									// 64-bit vector: extract D[0] only
 									builder.WriteString(fmt.Sprintf("\tVMOV %s.D[0], R9\n", vReg))
@@ -372,8 +528,8 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 		}
 	}
 
-	// write file
-	f, err := os.Create(path)
+	// Write file
+	f, err := os.Create(t.GoAssembly)
 	if err != nil {
 		return err
 	}
@@ -389,4 +545,8 @@ func (t *TranslateUnit) generateGoAssembly(path string, functions []Function) er
 	}
 	_, err = f.Write(bytes)
 	return err
+}
+
+func init() {
+	RegisterParser("arm64", &ARM64Parser{})
 }
