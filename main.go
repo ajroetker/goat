@@ -320,20 +320,21 @@ func X86SIMDAlignment(t string) int {
 }
 
 type TranslateUnit struct {
-	Source     string
-	Assembly   string
-	Object     string
-	GoAssembly string
-	Go         string
-	Package    string
-	Options    []string
-	Offset     int
-	Target     string     // Target architecture (amd64, arm64, etc.)
-	TargetOS   string     // Target OS (darwin, linux, etc.)
-	parser     ArchParser // Architecture-specific parser
+	Source       string
+	Assembly     string
+	Object       string
+	GoAssembly   string
+	Go           string
+	Package      string
+	Options      []string
+	IncludePaths []string   // Additional include paths for C parser
+	Offset       int
+	Target       string     // Target architecture (amd64, arm64, etc.)
+	TargetOS     string     // Target OS (darwin, linux, etc.)
+	parser       ArchParser // Architecture-specific parser
 }
 
-func NewTranslateUnit(source string, outputDir string, target string, targetOS string, options ...string) (TranslateUnit, error) {
+func NewTranslateUnit(source string, outputDir string, target string, targetOS string, includePaths []string, options ...string) (TranslateUnit, error) {
 	sourceExt := filepath.Ext(source)
 	noExtSourcePath := source[:len(source)-len(sourceExt)]
 	noExtSourceBase := filepath.Base(noExtSourcePath)
@@ -344,16 +345,17 @@ func NewTranslateUnit(source string, outputDir string, target string, targetOS s
 	}
 
 	return TranslateUnit{
-		Source:     source,
-		Assembly:   noExtSourcePath + ".s",
-		Object:     noExtSourcePath + ".o",
-		GoAssembly: filepath.Join(outputDir, noExtSourceBase+".s"),
-		Go:         filepath.Join(outputDir, noExtSourceBase+".go"),
-		Package:    filepath.Base(outputDir),
-		Options:    options,
-		Target:     target,
-		TargetOS:   targetOS,
-		parser:     parser,
+		Source:       source,
+		Assembly:     noExtSourcePath + ".s",
+		Object:       noExtSourcePath + ".o",
+		GoAssembly:   filepath.Join(outputDir, noExtSourceBase+".s"),
+		Go:           filepath.Join(outputDir, noExtSourceBase+".go"),
+		Package:      filepath.Base(outputDir),
+		Options:      options,
+		IncludePaths: includePaths,
+		Target:       target,
+		TargetOS:     targetOS,
+		parser:       parser,
 	}, nil
 }
 
@@ -366,6 +368,10 @@ func (t *TranslateUnit) parseSource() ([]Function, error) {
 	cfg, err := cc.NewConfig(t.TargetOS, t.Target)
 	if err != nil {
 		return nil, err
+	}
+	// Add custom include paths for cross-compilation
+	if len(t.IncludePaths) > 0 {
+		cfg.SysIncludePaths = append(t.IncludePaths, cfg.SysIncludePaths...)
 	}
 	var prologue strings.Builder
 	// Add RISC-V vector support if available
@@ -698,7 +704,8 @@ var command = &cobra.Command{
 		options = append(options, extraOptions...)
 		optimizeLevel, _ := cmd.PersistentFlags().GetInt("optimize-level")
 		options = append(options, fmt.Sprintf("-O%d", optimizeLevel))
-		file, err := NewTranslateUnit(args[0], output, target, targetOS, options...)
+		includePaths, _ := cmd.PersistentFlags().GetStringSlice("include-path")
+		file, err := NewTranslateUnit(args[0], output, target, targetOS, includePaths, options...)
 		if err != nil {
 			_, _ = fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -718,6 +725,7 @@ func init() {
 	command.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "if set, increase verbosity level")
 	command.PersistentFlags().StringP("target", "t", runtime.GOARCH, "target architecture (amd64, arm64, loong64, riscv64)")
 	command.PersistentFlags().String("target-os", runtime.GOOS, "target operating system (darwin, linux, windows)")
+	command.PersistentFlags().StringSliceP("include-path", "I", nil, "additional include path for C parser (for cross-compilation)")
 }
 
 func main() {

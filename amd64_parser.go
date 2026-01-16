@@ -33,10 +33,11 @@ type AMD64Parser struct{}
 var (
 	amd64AttributeLine = regexp.MustCompile(`^\s+\..+$`)
 	amd64NameLine      = regexp.MustCompile(`^\w+:.+$`)
-	amd64LabelLine     = regexp.MustCompile(`^\.\w+_\d+:.*$`)
-	amd64CodeLine      = regexp.MustCompile(`^\s+\w+.+$`)
-	amd64SymbolLine    = regexp.MustCompile(`^\w+\s+<\w+>:$`)
-	amd64DataLine      = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
+	// Match labels like .LBB0_2: (Linux) or LBB0_2: (macOS)
+	amd64LabelLine  = regexp.MustCompile(`^\.?\w+_\d+:.*$`)
+	amd64CodeLine   = regexp.MustCompile(`^\s+\w+.+$`)
+	amd64SymbolLine = regexp.MustCompile(`^\w+\s+<\w+>:$`)
+	amd64DataLine   = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
 )
 
 // amd64 register sets
@@ -59,9 +60,20 @@ func (line *amd64Line) String() string {
 	var builder strings.Builder
 	builder.WriteString("\t")
 	if strings.HasPrefix(line.Assembly, "j") {
-		splits := strings.Split(line.Assembly, ".")
-		op := strings.TrimSpace(splits[0])
-		operand := splits[1]
+		// Handle both Linux (jl .LBB0_1) and macOS (jl LBB0_1) jump formats
+		var op, operand string
+		if strings.Contains(line.Assembly, ".") {
+			// Linux format: jl .LBB0_1 - split by dot
+			splits := strings.Split(line.Assembly, ".")
+			op = strings.TrimSpace(splits[0])
+			operand = splits[1]
+		} else {
+			// macOS format: jl LBB0_1 - split by whitespace
+			fields := strings.Fields(line.Assembly)
+			op = fields[0]
+			// Label is the second field, strip L prefix to get BB0_1
+			operand = strings.TrimPrefix(fields[1], "L")
+		}
 		builder.WriteString(fmt.Sprintf("%s %s", strings.ToUpper(op), operand))
 	} else {
 		pos := 0
@@ -119,6 +131,14 @@ func (p *AMD64Parser) CompilerFlags() []string {
 // Prologue returns C parser prologue for x86 SIMD types
 func (p *AMD64Parser) Prologue() string {
 	var prologue strings.Builder
+	// Define x86-64 architecture macros for cross-compilation
+	// These are needed so x86 intrinsics headers don't error out
+	prologue.WriteString("#ifndef __x86_64__\n")
+	prologue.WriteString("#define __x86_64__ 1\n")
+	prologue.WriteString("#endif\n")
+	prologue.WriteString("#ifndef __amd64__\n")
+	prologue.WriteString("#define __amd64__ 1\n")
+	prologue.WriteString("#endif\n")
 	// Define GOAT_PARSER to skip includes during parsing
 	prologue.WriteString("#define GOAT_PARSER 1\n")
 	// Define x86 SIMD types as opaque structs for the parser
@@ -193,6 +213,20 @@ func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]
 		line := scanner.Text()
 		if amd64AttributeLine.MatchString(line) {
 			continue
+		} else if amd64LabelLine.MatchString(line) {
+			// Check labels BEFORE function names because labels like "LBB0_2: ; comment"
+			// can match the function name pattern due to content after the colon
+			labelName = strings.Split(line, ":")[0]
+			// Strip leading dot if present (Linux uses .LBB0_2, macOS uses LBB0_2)
+			if strings.HasPrefix(labelName, ".") {
+				labelName = labelName[1:]
+			}
+			lines := functions[functionName]
+			if len(lines) > 0 && lines[len(lines)-1].Assembly == "" {
+				lines[len(lines)-1].Labels = append(lines[len(lines)-1].Labels, labelName)
+			} else {
+				functions[functionName] = append(functions[functionName], &amd64Line{Labels: []string{labelName}})
+			}
 		} else if amd64NameLine.MatchString(line) {
 			functionName = strings.Split(line, ":")[0]
 			// On macOS, function names are prefixed with underscore - strip it
@@ -201,15 +235,6 @@ func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]
 			}
 			functions[functionName] = make([]*amd64Line, 0)
 			labelName = ""
-		} else if amd64LabelLine.MatchString(line) {
-			labelName = strings.Split(line, ":")[0]
-			labelName = labelName[1:]
-			lines := functions[functionName]
-			if len(lines) > 0 && lines[len(lines)-1].Assembly == "" {
-				lines[len(lines)-1].Labels = append(lines[len(lines)-1].Labels, labelName)
-			} else {
-				functions[functionName] = append(functions[functionName], &amd64Line{Labels: []string{labelName}})
-			}
 		} else if amd64CodeLine.MatchString(line) {
 			asm := amd64SanitizeAsm(line)
 			if labelName == "" {

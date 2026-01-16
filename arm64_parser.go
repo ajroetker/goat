@@ -33,11 +33,13 @@ type ARM64Parser struct{}
 var (
 	arm64AttributeLine = regexp.MustCompile(`^\s+\..+$`)
 	arm64NameLine      = regexp.MustCompile(`^\w+:.+$`)
-	arm64LabelLine     = regexp.MustCompile(`^\.\w+_\d+:.*$`)
-	arm64CodeLine      = regexp.MustCompile(`^\s+\w+.+$`)
-	arm64JmpLine       = regexp.MustCompile(`^(b|b\.\w{2})\t\.\w+_\d+$`)
-	arm64SymbolLine    = regexp.MustCompile(`^\w+\s+<\w+>:$`)
-	arm64DataLine      = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
+	// Match labels like .LBB0_2: (Linux) or LBB0_2: (macOS)
+	arm64LabelLine = regexp.MustCompile(`^\.?\w+_\d+:.*$`)
+	arm64CodeLine  = regexp.MustCompile(`^\s+\w+.+$`)
+	// Match jumps to labels with or without leading dot
+	arm64JmpLine    = regexp.MustCompile(`^(b|b\.\w{2})\t\.?\w+_\d+$`)
+	arm64SymbolLine = regexp.MustCompile(`^\w+\s+<\w+>:$`)
+	arm64DataLine   = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
 )
 
 // arm64 register sets
@@ -229,6 +231,20 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 		line := scanner.Text()
 		if arm64AttributeLine.MatchString(line) {
 			continue
+		} else if arm64LabelLine.MatchString(line) {
+			// Check labels BEFORE function names because labels like "LBB0_2: ; comment"
+			// can match the function name pattern due to content after the colon
+			labelName = strings.Split(line, ":")[0]
+			// Strip leading dot if present (Linux uses .LBB0_2, macOS uses LBB0_2)
+			if strings.HasPrefix(labelName, ".") {
+				labelName = labelName[1:]
+			}
+			lines := functions[functionName]
+			if len(lines) == 0 || lines[len(lines)-1].Assembly != "" {
+				functions[functionName] = append(functions[functionName], &arm64Line{Labels: []string{labelName}})
+			} else {
+				lines[len(lines)-1].Labels = append(lines[len(lines)-1].Labels, labelName)
+			}
 		} else if arm64NameLine.MatchString(line) {
 			functionName = strings.Split(line, ":")[0]
 			// On macOS, function names are prefixed with underscore - strip it
@@ -237,15 +253,6 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 			}
 			functions[functionName] = make([]*arm64Line, 0)
 			labelName = ""
-		} else if arm64LabelLine.MatchString(line) {
-			labelName = strings.Split(line, ":")[0]
-			labelName = labelName[1:]
-			lines := functions[functionName]
-			if len(lines) == 1 || lines[len(lines)-1].Assembly != "" {
-				functions[functionName] = append(functions[functionName], &arm64Line{Labels: []string{labelName}})
-			} else {
-				lines[len(lines)-1].Labels = append(lines[len(lines)-1].Labels, labelName)
-			}
 		} else if arm64CodeLine.MatchString(line) {
 			asm := strings.Split(line, "//")[0]
 			asm = strings.TrimSpace(asm)
