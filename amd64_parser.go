@@ -146,12 +146,14 @@ func (p *AMD64Parser) Prologue() string {
 	prologue.WriteString("typedef struct { char _[16]; } __m128;\n")
 	prologue.WriteString("typedef struct { char _[16]; } __m128d;\n")
 	prologue.WriteString("typedef struct { char _[16]; } __m128i;\n")
-	prologue.WriteString("typedef struct { char _[16]; } __m128h;\n") // FP16
+	prologue.WriteString("typedef struct { char _[16]; } __m128h;\n")  // FP16
+	prologue.WriteString("typedef struct { char _[16]; } __m128bh;\n") // BF16
 	// AVX (256-bit)
 	prologue.WriteString("typedef struct { char _[32]; } __m256;\n")
 	prologue.WriteString("typedef struct { char _[32]; } __m256d;\n")
 	prologue.WriteString("typedef struct { char _[32]; } __m256i;\n")
-	prologue.WriteString("typedef struct { char _[32]; } __m256h;\n") // FP16
+	prologue.WriteString("typedef struct { char _[32]; } __m256h;\n")  // FP16
+	prologue.WriteString("typedef struct { char _[32]; } __m256bh;\n") // BF16
 	// AVX-512 (512-bit)
 	prologue.WriteString("typedef struct { char _[64]; } __m512;\n")
 	prologue.WriteString("typedef struct { char _[64]; } __m512d;\n")
