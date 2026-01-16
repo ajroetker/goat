@@ -172,6 +172,9 @@ func (p *ARM64Parser) Prologue() string {
 		prologue.WriteString(fmt.Sprintf("typedef struct { char _[32]; } %sx4_t;\n", base))
 	}
 
+	// Add SVE/SME types and intrinsic stubs from arm64_sve.go
+	prologue.WriteString(SVEPrologue())
+
 	return prologue.String()
 }
 
@@ -192,6 +195,11 @@ func (p *ARM64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) 
 	// Parse object dump
 	if err := p.parseObjectDump(dump, assembly, t.TargetOS); err != nil {
 		return err
+	}
+
+	// Auto-transform SVE/SME functions (inject smstart/smstop, fix forbidden instructions)
+	for fnName, lines := range assembly {
+		assembly[fnName] = TransformSVEFunction(lines)
 	}
 
 	// Copy lines to functions

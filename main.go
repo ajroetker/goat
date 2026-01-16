@@ -531,6 +531,11 @@ func (p ParameterType) String() string {
 		// x86 SIMD vectors are passed as fixed-size byte arrays in Go
 		return fmt.Sprintf("[%d]byte", sz)
 	}
+	// Check for SVE scalable vector types (size determined at runtime)
+	if IsSVEType(p.Type) {
+		// SVE vectors must be passed as pointers since size is unknown at compile time
+		return "unsafe.Pointer"
+	}
 	switch p.Type {
 	case "_Bool":
 		return "bool"
@@ -597,8 +602,8 @@ func (t *TranslateUnit) convertFunctionParameters(params *cc.ParameterList) ([]P
 		paramType = declaration.DeclarationSpecifiers.TypeSpecifier.Token.SrcStr()
 	}
 	isPointer := declaration.Declarator.Pointer != nil
-	// Accept scalar types, NEON vector types, x86 SIMD types, or pointers
-	if _, ok := supportedTypes[paramType]; !ok && !IsNeonType(paramType) && !IsX86SIMDType(paramType) && !isPointer {
+	// Accept scalar types, NEON vector types, x86 SIMD types, SVE types, or pointers
+	if _, ok := supportedTypes[paramType]; !ok && !IsNeonType(paramType) && !IsX86SIMDType(paramType) && !IsSVEType(paramType) && !isPointer {
 		position := declaration.Position()
 		return nil, fmt.Errorf("%v:%v:%v: error: unsupported type: %v",
 			position.Filename, position.Line+t.Offset, position.Column, paramType)
