@@ -36,7 +36,7 @@ var (
 	arm64NameLine      = regexp.MustCompile(`^\w+:.+$`)
 	// Match labels like .LBB0_2: (Linux) or LBB0_2: (macOS)
 	arm64LabelLine = regexp.MustCompile(`^\.?\w+_\d+:.*$`)
-	arm64CodeLine  = regexp.MustCompile(`^\s+\w+.+$`)
+	arm64CodeLine  = regexp.MustCompile(`^\s+\w+.*$`)
 	// Match jumps to labels with or without leading dot
 	arm64JmpLine    = regexp.MustCompile(`^(b|b\.\w{2})\t\.?\w+_\d+$`)
 	arm64SymbolLine = regexp.MustCompile(`^\w+\s+<\w+>:$`)

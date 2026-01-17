@@ -48,6 +48,12 @@ var (
 	// DUP: broadcast scalar to vector
 	sveDUP = regexp.MustCompile(`dup\s+z\d+\.\w+,\s*[wx]\d+`)
 
+	// SVE prologue/epilogue instructions (stack management)
+	// addvl: add vector length scaled immediate to register
+	sveAddvl = regexp.MustCompile(`addvl\s+`)
+	// rdsvl: read scalable vector length
+	sveRdsvl = regexp.MustCompile(`rdsvl\s+`)
+
 	// SVE2 (extended) patterns
 	sve2Match  = regexp.MustCompile(`(match|nmatch|histcnt|histseg)\s+`)
 	sve2Crypto = regexp.MustCompile(`(aesd|aese|aesmc|aesimc)\s+`)
@@ -297,18 +303,8 @@ func injectStreamingMode(lines []*arm64Line) []*arm64Line {
 		if line.Assembly == "" {
 			continue
 		}
-		// Check for any SVE/SME instruction including setup
-		if sveZReg.MatchString(line.Assembly) ||
-			smeFMOPA.MatchString(line.Assembly) ||
-			smeMOVA.MatchString(line.Assembly) ||
-			smeZero.MatchString(line.Assembly) ||
-			sveLD1.MatchString(line.Assembly) ||
-			sveST1.MatchString(line.Assembly) ||
-			sveLDR.MatchString(line.Assembly) ||
-			sveSTR.MatchString(line.Assembly) ||
-			sveDUP.MatchString(line.Assembly) ||
-			svePtrue.MatchString(line.Assembly) ||
-			sveCnt.MatchString(line.Assembly) {
+		// Check for any SVE/SME instruction including setup and prologue
+		if isSVEInstruction(line.Assembly) {
 			firstSVE = i
 			break
 		}
@@ -539,7 +535,9 @@ func isSVEInstruction(asm string) bool {
 		sveSTR.MatchString(asm) ||
 		sveDUP.MatchString(asm) ||
 		svePtrue.MatchString(asm) ||
-		sveCnt.MatchString(asm)
+		sveCnt.MatchString(asm) ||
+		sveAddvl.MatchString(asm) ||
+		sveRdsvl.MatchString(asm)
 }
 
 // ensureSmstopBeforeRet adds smstop before all ret instructions in an SVE function.
