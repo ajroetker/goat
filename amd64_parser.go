@@ -133,6 +133,9 @@ func (p *AMD64Parser) Prologue() string {
 	prologue.WriteString("#endif\n")
 	// Define GOAT_PARSER to skip includes during parsing
 	prologue.WriteString("#define GOAT_PARSER 1\n")
+	// Define scalar half-precision types for the parser
+	prologue.WriteString("typedef unsigned short __bf16;\n")   // BF16 scalar
+	prologue.WriteString("typedef unsigned short _Float16;\n") // FP16 scalar
 	// Define x86 SIMD types as opaque structs for the parser
 	// SSE (128-bit)
 	prologue.WriteString("typedef struct { char _[16]; } __m128;\n")
