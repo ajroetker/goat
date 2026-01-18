@@ -374,19 +374,20 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function)
 		for _, param := range function.Parameters {
 			// Calculate slot size based on type
 			sz := 8 // Default 8-byte slot
-			alignTo := 8
 			if !param.Pointer {
 				if neonSz := NeonTypeSize(param.Type); neonSz > 0 {
 					sz = neonSz // Use actual NEON type size
-					alignTo = sz
-					if alignTo > 16 {
-						alignTo = 16 // Cap alignment at 16 bytes
-					}
 				} else if param.Type == "float" {
-					sz = 4      // float32 is 4 bytes
-					alignTo = 4 // 4-byte alignment
+					sz = 4 // float32 is 4 bytes
 				}
 				// double, int64_t, long, pointers use default 8 bytes
+			}
+			// Go's ABI uses 8-byte alignment for stack parameters, regardless of type.
+			// The natural alignment of SIMD types is a hardware concern handled by registers,
+			// not by padding the stack frame.
+			alignTo := 8
+			if sz < 8 {
+				alignTo = sz // Smaller types can use their natural alignment
 			}
 			// Align offset
 			if offset%alignTo != 0 {
