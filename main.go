@@ -30,6 +30,7 @@ import (
 )
 
 var supportedTypes = map[string]int{
+	"int32_t": 4,
 	"int64_t": 8,
 	"long":    8,
 	"float":   4,
@@ -449,6 +450,8 @@ func (t *TranslateUnit) generateGoStubs(functions []Function) error {
 				builder.WriteString(" (result float64)")
 			case "float":
 				builder.WriteString(" (result float32)")
+			case "int32_t":
+				builder.WriteString(" (result int32)")
 			case "int64_t", "long":
 				builder.WriteString(" (result int64)")
 			default:
@@ -539,6 +542,8 @@ func (p ParameterType) String() string {
 	switch p.Type {
 	case "_Bool":
 		return "bool"
+	case "int32_t":
+		return "int32"
 	case "int64_t", "long":
 		return "int64"
 	case "double":
