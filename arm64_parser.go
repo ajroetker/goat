@@ -515,8 +515,8 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function)
 			stackOffset += 16 - stackOffset%16
 		}
 
-		// Return value must be 8-byte aligned in Go's ABI
-		if offset%8 != 0 {
+		// Return value must be 8-byte aligned in Go's ABI (only if there is a return value)
+		if returnSize > 0 && offset%8 != 0 {
 			offset += 8 - offset%8
 		}
 
