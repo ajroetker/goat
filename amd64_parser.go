@@ -356,16 +356,15 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function)
 				}
 			}
 
-			// Go's ABI uses 8-byte alignment for stack parameters, regardless of type.
-			// The natural alignment of SIMD types is a hardware concern handled by registers,
-			// not by padding the stack frame.
-			alignTo := 8
-			if sz < 8 {
-				alignTo = sz // Smaller types can use their natural alignment
-			}
+			// Go's ABI uses 8-byte alignment for stack parameters on 64-bit systems.
+			// Even smaller types (int32_t, float) get 8-byte slots.
+			// SIMD types 16+ bytes get their natural alignment.
+			alignTo := max(8, sz)
 			if offset%alignTo != 0 {
 				offset += alignTo - offset%alignTo
 			}
+			// For frame size calculation, always advance by at least 8 bytes
+			sz = max(8, sz)
 
 			if !param.Pointer && IsX86SIMDType(param.Type) {
 				if xmmRegisterIndex < len(amd64XMMRegisters) {
