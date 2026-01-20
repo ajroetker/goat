@@ -403,8 +403,12 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function)
 
 			// Go's ABI uses 8-byte alignment for stack parameters on 64-bit systems.
 			// Parameters are placed at 8-byte aligned offsets.
-			// SIMD types 16+ bytes get their natural alignment.
-			alignTo := max(8, sz)
+			// The natural alignment of SIMD types is a hardware concern handled by registers,
+			// not by padding the stack frame.
+			alignTo := 8
+			if sz < 8 {
+				alignTo = sz // Smaller types can use their natural alignment
+			}
 			if offset%alignTo != 0 {
 				offset += alignTo - offset%alignTo
 			}
