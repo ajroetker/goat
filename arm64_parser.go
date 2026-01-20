@@ -45,6 +45,10 @@ var (
 	arm64StackAllocLine = regexp.MustCompile(`^\s*sub\s+sp,\s*sp,\s*#(\d+)`)
 	// Match pre-decrement stack allocation: "stp ... [sp, #-N]!"
 	arm64StackPreDecLine = regexp.MustCompile(`\[sp,\s*#-(\d+)\]!`)
+	// Match post-increment stack deallocation: "ldp ... [sp], #N"
+	arm64StackPostIncLine = regexp.MustCompile(`\[sp\],\s*#(\d+)`)
+	// Match explicit stack deallocation: "add sp, sp, #N"
+	arm64StackDeallocLine = regexp.MustCompile(`^\s*add\s+sp,\s*sp,\s*#(\d+)`)
 )
 
 // arm64 register sets
@@ -62,8 +66,96 @@ type arm64Line struct {
 	Binary   string
 }
 
+// transformStackInstruction transforms pre/post-indexed stack operations to
+// regular offset addressing. This is necessary because Go assembly allocates
+// the stack frame in the TEXT directive, but C compilers generate pre/post-indexed
+// addressing that also adjusts SP.
+//
+// Transforms:
+//   - stp Rt, Rt2, [sp, #-N]! -> stp Rt, Rt2, [sp, #0]  (pre-indexed store)
+//   - ldp Rt, Rt2, [sp], #N   -> ldp Rt, Rt2, [sp, #0]  (post-indexed load)
+//   - sub sp, sp, #N          -> (removed, returns empty)
+//   - add sp, sp, #N          -> (removed, returns empty)
+//
+// ARM64 LDP/STP instruction encoding (64-bit registers):
+//   Bits 31-30: opc (10 for 64-bit)
+//   Bits 29-27: 101 (op0 for LDP/STP)
+//   Bit 26: V (0 for integer, 1 for SIMD)
+//   Bits 25-23: op2 (includes addressing mode)
+//     - 011 = pre-indexed (writeback before)
+//     - 001 = post-indexed (writeback after)
+//     - 010 = signed offset (no writeback)
+//   Bit 22: L (0 for store, 1 for load)
+//   Bits 21-15: imm7 (signed, scaled by 8 for 64-bit)
+//   Bits 14-10: Rt2
+//   Bits 9-5: Rn (base register)
+//   Bits 4-0: Rt
+func (line *arm64Line) transformStackInstruction() (string, bool) {
+	asm := line.Assembly
+
+	// Skip explicit stack allocation/deallocation - Go handles this
+	if arm64StackAllocLine.MatchString(asm) || arm64StackDeallocLine.MatchString(asm) {
+		return "", true // Remove this instruction
+	}
+
+	// Check for pre-indexed stp/ldp with SP
+	if arm64StackPreDecLine.MatchString(asm) {
+		// Parse the binary as hex
+		binary, err := strconv.ParseUint(line.Binary, 16, 32)
+		if err != nil {
+			return "", false
+		}
+
+		// Transform pre-indexed to signed-offset:
+		// - Clear bit 23 (change 011 to 010 in op2)
+		// - Zero out imm7 (bits 21-15)
+		binary &^= (1 << 23)           // Clear bit 23 (pre-indexed -> signed offset)
+		binary &^= (0x7f << 15)        // Zero imm7 (offset = 0)
+
+		return fmt.Sprintf("%08x", binary), true
+	}
+
+	// Check for post-indexed ldp with SP
+	if arm64StackPostIncLine.MatchString(asm) {
+		// Parse the binary as hex
+		binary, err := strconv.ParseUint(line.Binary, 16, 32)
+		if err != nil {
+			return "", false
+		}
+
+		// Transform post-indexed to signed-offset:
+		// - Set bit 24, clear bit 23 (change 001 to 010 in op2)
+		// - Zero out imm7 (bits 21-15)
+		binary |= (1 << 24)            // Set bit 24
+		binary &^= (1 << 23)           // Clear bit 23 (post-indexed -> signed offset)
+		binary &^= (0x7f << 15)        // Zero imm7 (offset = 0)
+
+		// Return new binary
+		return fmt.Sprintf("%08x", binary), true
+	}
+
+	return "", false
+}
+
 func (line *arm64Line) String() string {
 	var builder strings.Builder
+
+	// Check for stack frame operations that need transformation
+	if newBinary, transformed := line.transformStackInstruction(); transformed {
+		if newBinary == "" {
+			// Instruction should be removed (e.g., sub sp, sp, #N)
+			return ""
+		}
+		// Use transformed binary
+		builder.WriteString("\t")
+		builder.WriteString(fmt.Sprintf("WORD $0x%s", newBinary))
+		builder.WriteString("\t// ")
+		builder.WriteString(line.Assembly)
+		builder.WriteString(" [transformed]")
+		builder.WriteString("\n")
+		return builder.String()
+	}
+
 	if arm64JmpLine.MatchString(line.Assembly) {
 		splits := strings.Split(line.Assembly, "\t")
 		instruction := strings.Map(func(r rune) rune {

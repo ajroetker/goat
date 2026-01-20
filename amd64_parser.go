@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -38,6 +39,16 @@ var (
 	amd64CodeLine   = regexp.MustCompile(`^\s+\w+.+$`)
 	amd64SymbolLine = regexp.MustCompile(`^\w+\s+<\w+>:$`)
 	amd64DataLine   = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
+
+	// Stack management patterns - these need to be removed since Go handles the frame
+	// Match "subq $N, %rsp" - stack allocation
+	amd64StackAllocLine = regexp.MustCompile(`subq\s+\$(\d+),\s*%rsp`)
+	// Match "addq $N, %rsp" - stack deallocation
+	amd64StackDeallocLine = regexp.MustCompile(`addq\s+\$(\d+),\s*%rsp`)
+	// Match "pushq %rbx" etc - callee-saved register push (rbx, rbp, r12-r15)
+	amd64CalleeSavePush = regexp.MustCompile(`pushq\s+%(rbx|rbp|r1[2-5])`)
+	// Match "popq %rbx" etc - callee-saved register pop
+	amd64CalleeSavePop = regexp.MustCompile(`popq\s+%(rbx|rbp|r1[2-5])`)
 )
 
 // amd64 register sets
@@ -95,6 +106,28 @@ func (line *amd64Line) String() string {
 	}
 	builder.WriteString("\n")
 	return builder.String()
+}
+
+// shouldSkip returns true if this instruction should be removed from output.
+// This handles C-style stack management that conflicts with Go's frame allocation.
+// Go allocates the stack frame via the TEXT directive, so we must remove:
+// - pushq/popq of callee-saved registers (rbx, rbp, r12-r15)
+// - subq $N, %rsp (stack allocation)
+// - addq $N, %rsp (stack deallocation)
+func (line *amd64Line) shouldSkip() bool {
+	asm := line.Assembly
+
+	// Skip callee-saved register push/pop
+	if amd64CalleeSavePush.MatchString(asm) || amd64CalleeSavePop.MatchString(asm) {
+		return true
+	}
+
+	// Skip explicit stack allocation/deallocation
+	if amd64StackAllocLine.MatchString(asm) || amd64StackDeallocLine.MatchString(asm) {
+		return true
+	}
+
+	return false
 }
 
 // Name returns the architecture name
@@ -245,6 +278,18 @@ func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]
 			labelName = ""
 		} else if amd64CodeLine.MatchString(line) {
 			asm := amd64SanitizeAsm(line)
+
+			// Detect stack allocation: "subq $N, %rsp"
+			// Record the maximum stack size for this function so TEXT directive
+			// can declare the correct frame size (Go handles frame allocation)
+			if matches := amd64StackAllocLine.FindStringSubmatch(asm); matches != nil {
+				if size, err := strconv.Atoi(matches[1]); err == nil {
+					if current, ok := stackSizes[functionName]; !ok || size > current {
+						stackSizes[functionName] = size
+					}
+				}
+			}
+
 			if labelName == "" {
 				functions[functionName] = append(functions[functionName], &amd64Line{Assembly: asm})
 			} else {
@@ -469,8 +514,20 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function)
 			stackOffset += 16 - stackOffset%16
 		}
 
+		// Use the larger of: calculated stack offset (for parameter spill) or
+		// detected stack size (from 'subq $N, %rsp' in the compiled assembly).
+		// Go allocates this frame, so we remove the C-generated subq/addq instructions.
+		frameSize := stackOffset
+		if function.StackSize > frameSize {
+			frameSize = function.StackSize
+		}
+		// Ensure 16-byte alignment for the frame if we're using C-detected stack size
+		if frameSize > 0 && frameSize%16 != 0 {
+			frameSize += 16 - frameSize%16
+		}
+
 		builder.WriteString(fmt.Sprintf("\nTEXT ·%v(SB), $%d-%d\n",
-			function.Name, stackOffset, offset+returnSize))
+			function.Name, frameSize, offset+returnSize))
 		builder.WriteString(argsBuilder.String())
 
 		if len(stack) > 0 {
@@ -486,6 +543,12 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function)
 			if !ok {
 				continue
 			}
+
+			// Skip C-style stack management instructions (Go handles the frame)
+			if line.shouldSkip() {
+				continue
+			}
+
 			for _, label := range line.Labels {
 				builder.WriteString(label)
 				builder.WriteString(":\n")
