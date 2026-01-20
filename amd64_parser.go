@@ -357,14 +357,13 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function)
 			}
 
 			// Go's ABI uses 8-byte alignment for stack parameters on 64-bit systems.
-			// Even smaller types (int32_t, float) get 8-byte slots.
+			// Parameters are placed at 8-byte aligned offsets.
 			// SIMD types 16+ bytes get their natural alignment.
 			alignTo := max(8, sz)
 			if offset%alignTo != 0 {
 				offset += alignTo - offset%alignTo
 			}
-			// For frame size calculation, always advance by at least 8 bytes
-			sz = max(8, sz)
+			// Frame size uses actual type size (go vet validates this)
 
 			if !param.Pointer && IsX86SIMDType(param.Type) {
 				if xmmRegisterIndex < len(amd64XMMRegisters) {
@@ -422,7 +421,19 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function)
 				}
 			} else {
 				if registerIndex < len(amd64Registers) {
-					argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s+%d(FP), %s\n", param.Name, offset, amd64Registers[registerIndex]))
+					// Use appropriate load instruction based on type size
+					loadInstr := "MOVQ" // Default 8-byte load
+					if !param.Pointer {
+						switch sz {
+						case 4:
+							loadInstr = "MOVL" // 4-byte load (zero-extends to 64-bit)
+						case 2:
+							loadInstr = "MOVWLZX" // 2-byte load with zero extension
+						case 1:
+							loadInstr = "MOVBLZX" // 1-byte load with zero extension
+						}
+					}
+					argsBuilder.WriteString(fmt.Sprintf("\t%s %s+%d(FP), %s\n", loadInstr, param.Name, offset, amd64Registers[registerIndex]))
 					registerIndex++
 				} else {
 					stack = append(stack, lo.Tuple2[int, Parameter]{A: offset, B: param})

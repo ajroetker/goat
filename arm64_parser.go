@@ -382,15 +382,14 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function)
 				}
 			}
 			// Go's ABI uses 8-byte alignment for stack parameters on 64-bit systems.
-			// Even smaller types (int32_t, float) get 8-byte slots.
+			// Parameters are placed at 8-byte aligned offsets.
 			// SIMD types 16+ bytes get their natural alignment.
 			alignTo := max(8, sz)
-			// Align offset
+			// Align offset to parameter boundary
 			if offset%alignTo != 0 {
 				offset += alignTo - offset%alignTo
 			}
-			// For frame size calculation, always advance by at least 8 bytes
-			sz = max(8, sz)
+			// Frame size uses actual type size (go vet validates this)
 
 			if !param.Pointer && IsNeonType(param.Type) {
 				// NEON vector type - load into V register(s)
@@ -435,7 +434,19 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function)
 				}
 			} else {
 				if registerCount < len(arm64Registers) {
-					argsBuilder.WriteString(fmt.Sprintf("\tMOVD %s+%d(FP), %s\n", param.Name, offset, arm64Registers[registerCount]))
+					// Use appropriate load instruction based on type size
+					loadInstr := "MOVD" // Default 8-byte load
+					if !param.Pointer {
+						switch sz {
+						case 4:
+							loadInstr = "MOVWU" // 4-byte unsigned load (zero-extends to 64-bit)
+						case 2:
+							loadInstr = "MOVHU" // 2-byte unsigned load
+						case 1:
+							loadInstr = "MOVBU" // 1-byte unsigned load
+						}
+					}
+					argsBuilder.WriteString(fmt.Sprintf("\t%s %s+%d(FP), %s\n", loadInstr, param.Name, offset, arm64Registers[registerCount]))
 					registerCount++
 				} else {
 					stack = append(stack, lo.Tuple2[int, Parameter]{A: offset, B: param})
