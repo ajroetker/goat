@@ -218,6 +218,9 @@ func (p *ARM64Parser) Prologue() string {
 	prologue.WriteString("typedef short __bf16;\n")
 	// Define __fp16 for arm_fp16.h
 	prologue.WriteString("typedef short __fp16;\n")
+	// Define standard C type aliases (used in SVE intrinsics)
+	prologue.WriteString("typedef __fp16 float16_t;\n")
+	prologue.WriteString("typedef __bf16 bfloat16_t;\n")
 
 	// Define NEON 64-bit vector types
 	prologue.WriteString("typedef struct { char _[8]; } int8x8_t;\n")
