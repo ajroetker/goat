@@ -43,9 +43,9 @@ var (
 	// Match constant pool labels: .LCPI0_0:
 	riscv64ConstPoolLabel = regexp.MustCompile(`^\.LCPI\d+_\d+:`)
 	// Match .word directive with hex or decimal value
-	riscv64WordDirective = regexp.MustCompile(`^\s+\.word\s+(\d+|0x[0-9a-fA-F]+)`)
+	riscv64WordDirective = regexp.MustCompile(`^\s+\.word\s+(0x[0-9a-fA-F]+|\d+)`)
 	// Match .dword directive with hex or decimal value
-	riscv64DwordDirective = regexp.MustCompile(`^\s+\.dword\s+(\d+|0x[0-9a-fA-F]+)`)
+	riscv64DwordDirective = regexp.MustCompile(`^\s+\.dword\s+(0x[0-9a-fA-F]+|\d+)`)
 	// Match section directive for rodata
 	riscv64RodataSection = regexp.MustCompile(`^\s+\.section\s+\.rodata`)
 	// Match auipc instruction referencing constant pool with %pcrel_hi
@@ -417,6 +417,7 @@ func (p *RISCV64Parser) generateGoAssembly(t *TranslateUnit, functions []Functio
 
 	// Emit DATA/GLOBL directives for constant pools
 	if len(constPools) > 0 {
+		builder.WriteString("\n#include \"textflag.h\"\n")
 		builder.WriteString("\n// Constant pool data\n")
 		for label, pool := range constPools {
 			// Emit DATA directive with little-endian byte order
@@ -425,7 +426,7 @@ func (p *RISCV64Parser) generateGoAssembly(t *TranslateUnit, functions []Functio
 				builder.WriteString(fmt.Sprintf("DATA %s<>+%d(SB)/4, $0x%08x\n", label, i*4, val))
 			}
 			// Emit GLOBL directive to define the symbol size
-			builder.WriteString(fmt.Sprintf("GLOBL %s<>(SB), RODATA|NOPTR, $%d\n", label, pool.Size))
+			builder.WriteString(fmt.Sprintf("GLOBL %s<>(SB), (RODATA|NOPTR), $%d\n", label, pool.Size))
 		}
 	}
 

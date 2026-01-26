@@ -586,6 +586,7 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 
 	// Emit DATA/GLOBL directives for constant pools
 	if len(constPools) > 0 {
+		builder.WriteString("\n#include \"textflag.h\"\n")
 		builder.WriteString("\n// Constant pool data\n")
 		for label, pool := range constPools {
 			// Emit DATA directive with little-endian byte order
@@ -594,7 +595,7 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 				builder.WriteString(fmt.Sprintf("DATA %s<>+%d(SB)/4, $0x%08x\n", label, i*4, val))
 			}
 			// Emit GLOBL directive to define the symbol size
-			builder.WriteString(fmt.Sprintf("GLOBL %s<>(SB), RODATA|NOPTR, $%d\n", label, pool.Size))
+			builder.WriteString(fmt.Sprintf("GLOBL %s<>(SB), (RODATA|NOPTR), $%d\n", label, pool.Size))
 		}
 	}
 
