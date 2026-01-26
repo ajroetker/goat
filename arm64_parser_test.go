@@ -185,3 +185,207 @@ func containsHelper(s, substr string) bool {
 	}
 	return false
 }
+
+// Constant pool tests
+
+func TestConstPoolLabelRegex(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected bool
+	}{
+		{"lCPI0_0:", true},
+		{".LCPI0_0:", true},
+		{"CPI0_0:", true},
+		{"lCPI12_34:", true},
+		{".LCPI99_99:", true},
+		{"LBB0_1:", false},        // branch label, not const pool
+		{".LBB0_1:", false},       // branch label, not const pool
+		{"_my_function:", false},  // function name
+		{"some_label:", false},    // generic label
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			matched := arm64ConstPoolLabel.MatchString(tt.input)
+			if matched != tt.expected {
+				t.Errorf("ConstPoolLabel(%q) = %v, want %v", tt.input, matched, tt.expected)
+			}
+		})
+	}
+}
+
+func TestLongDirectiveRegex(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected bool
+		value    string
+	}{
+		{"\t.long\t0", true, "0"},
+		{"\t.long\t1", true, "1"},
+		{"\t.long\t0x3f800000", true, "0x3f800000"},
+		{"  .long  12345", true, "12345"},
+		{"\t.quad\t0", false, ""},  // quad, not long
+		{"\tadd\tx0, x1", false, ""}, // not a directive
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			matches := arm64LongDirective.FindStringSubmatch(tt.input)
+			matched := matches != nil
+			if matched != tt.expected {
+				t.Errorf("LongDirective(%q) matched = %v, want %v", tt.input, matched, tt.expected)
+			}
+			if matched && tt.value != "" && matches[1] != tt.value {
+				t.Errorf("LongDirective(%q) value = %q, want %q", tt.input, matches[1], tt.value)
+			}
+		})
+	}
+}
+
+func TestParseIntValue(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected uint64
+	}{
+		{"0", 0},
+		{"1", 1},
+		{"12345", 12345},
+		{"0x0", 0},
+		{"0x1", 1},
+		{"0x3f800000", 0x3f800000},
+		{"0xFFFFFFFF", 0xFFFFFFFF},
+		{"0X10", 16},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			result := parseIntValue(tt.input)
+			if result != tt.expected {
+				t.Errorf("parseIntValue(%q) = %d, want %d", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestGoRegisterName(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		// General purpose registers
+		{"x0", "R0"},
+		{"x9", "R9"},
+		{"x30", "R30"},
+		{"w0", "R0"},
+		{"w15", "R15"},
+		// NEON vector registers
+		{"q0", "V0"},
+		{"q15", "V15"},
+		{"d0", "V0"},
+		{"d31", "V31"},
+		// Floating point registers
+		{"s0", "F0"},
+		{"s7", "F7"},
+		// Mixed case
+		{"X0", "R0"},
+		{"Q0", "V0"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			result := goRegisterName(tt.input)
+			if result != tt.expected {
+				t.Errorf("goRegisterName(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestAdrpConstPoolRegex(t *testing.T) {
+	tests := []struct {
+		input      string
+		expected   bool
+		baseReg    string
+		constLabel string
+	}{
+		{"adrp\tx9, lCPI0_0@PAGE", true, "x9", "0_0"},
+		{"adrp\tx10, lCPI12_34@PAGE", true, "x10", "12_34"},
+		{"adrp\tx0, .LCPI5_6@PAGE", true, "x0", "5_6"},
+		{"adrp\tx9, some_symbol@PAGE", false, "", ""},
+		{"ldr\tq0, [x9]", false, "", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			matches := arm64AdrpConstPool.FindStringSubmatch(tt.input)
+			matched := matches != nil
+			if matched != tt.expected {
+				t.Errorf("AdrpConstPool(%q) matched = %v, want %v", tt.input, matched, tt.expected)
+			}
+			if matched {
+				if matches[1] != tt.baseReg {
+					t.Errorf("AdrpConstPool(%q) baseReg = %q, want %q", tt.input, matches[1], tt.baseReg)
+				}
+				if matches[2] != tt.constLabel {
+					t.Errorf("AdrpConstPool(%q) constLabel = %q, want %q", tt.input, matches[2], tt.constLabel)
+				}
+			}
+		})
+	}
+}
+
+func TestLdrConstPoolPageoffRegex(t *testing.T) {
+	tests := []struct {
+		input      string
+		expected   bool
+		destReg    string
+		baseReg    string
+		constLabel string
+	}{
+		{"ldr\tq1, [x9, lCPI0_0@PAGEOFF]", true, "q1", "x9", "0_0"},
+		{"ldr\tq2, [x10, lCPI12_34@PAGEOFF]", true, "q2", "x10", "12_34"},
+		{"ldr\td0, [x0, .LCPI5_6@PAGEOFF]", true, "d0", "x0", "5_6"},
+		{"ldr\tx0, [x1, lCPI0_0@PAGEOFF]", true, "x0", "x1", "0_0"},
+		{"ldr\tq0, [x0]", false, "", "", ""},
+		{"str\tq0, [x9, lCPI0_0@PAGEOFF]", false, "", "", ""}, // store, not load
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			matches := arm64LdrConstPoolPageoff.FindStringSubmatch(tt.input)
+			matched := matches != nil
+			if matched != tt.expected {
+				t.Errorf("LdrConstPoolPageoff(%q) matched = %v, want %v", tt.input, matched, tt.expected)
+			}
+			if matched {
+				if matches[1] != tt.destReg {
+					t.Errorf("LdrConstPoolPageoff(%q) destReg = %q, want %q", tt.input, matches[1], tt.destReg)
+				}
+				if matches[2] != tt.baseReg {
+					t.Errorf("LdrConstPoolPageoff(%q) baseReg = %q, want %q", tt.input, matches[2], tt.baseReg)
+				}
+				if matches[3] != tt.constLabel {
+					t.Errorf("LdrConstPoolPageoff(%q) constLabel = %q, want %q", tt.input, matches[3], tt.constLabel)
+				}
+			}
+		})
+	}
+}
+
+func TestConstPoolStruct(t *testing.T) {
+	pool := &arm64ConstPool{
+		Label: "CPI0_0",
+		Data:  []uint32{0, 1, 2, 3},
+		Size:  16,
+	}
+
+	if pool.Label != "CPI0_0" {
+		t.Errorf("Label = %q, want %q", pool.Label, "CPI0_0")
+	}
+	if len(pool.Data) != 4 {
+		t.Errorf("len(Data) = %d, want 4", len(pool.Data))
+	}
+	if pool.Size != 16 {
+		t.Errorf("Size = %d, want 16", pool.Size)
+	}
+}

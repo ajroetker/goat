@@ -49,6 +49,22 @@ var (
 	arm64StackPostIncLine = regexp.MustCompile(`\[sp\],\s*#(\d+)`)
 	// Match explicit stack deallocation: "add sp, sp, #N"
 	arm64StackDeallocLine = regexp.MustCompile(`^\s*add\s+sp,\s*sp,\s*#(\d+)`)
+
+	// Constant pool patterns
+	// Match constant pool labels: lCPI0_0:, LCPI0_0:, .LCPI0_0:, .lCPI0_0:, CPI0_0:
+	arm64ConstPoolLabel = regexp.MustCompile(`^\.?[lL]?CPI\d+_\d+:`)
+	// Match .long directive with hex or decimal value (hex must come first in alternation)
+	arm64LongDirective = regexp.MustCompile(`^\s+\.long\s+(0x[0-9a-fA-F]+|\d+)`)
+	// Match .quad directive with hex or decimal value (hex must come first in alternation)
+	arm64QuadDirective = regexp.MustCompile(`^\s+\.quad\s+(0x[0-9a-fA-F]+|\d+)`)
+	// Match section directive for literal data
+	arm64LiteralSection = regexp.MustCompile(`^\s+\.section\s+__TEXT,__literal`)
+	// Match adrp instruction referencing constant pool
+	arm64AdrpConstPool = regexp.MustCompile(`adrp\s+(\w+),\s*\.?[lL]?CPI(\d+_\d+)@PAGE`)
+	// Match ldr instruction with constant pool PAGEOFF reference
+	arm64LdrConstPoolPageoff = regexp.MustCompile(`ldr\s+(\w+),\s*\[(\w+),\s*\.?[lL]?CPI(\d+_\d+)@PAGEOFF\]`)
+	// Match ldr instruction with just register (for Linux-style PC-relative)
+	arm64LdrConstPoolReg = regexp.MustCompile(`ldr\s+(\w+),\s*\[(\w+)\]`)
 )
 
 // arm64 register sets
@@ -64,6 +80,23 @@ type arm64Line struct {
 	Labels   []string
 	Assembly string
 	Binary   string
+}
+
+// arm64ConstPool represents a constant pool entry with its label and data
+type arm64ConstPool struct {
+	Label string   // e.g., "CPI0_0" (without leading l or .)
+	Data  []uint32 // Data as 32-bit words (for .long directives)
+	Size  int      // Total size in bytes
+}
+
+// arm64ConstPoolRef tracks a constant pool reference that needs to be rewritten
+// When we see adrp+ldr pairs that reference constant pools, we need to rewrite them
+type arm64ConstPoolRef struct {
+	AdrpIndex int    // Index of adrp instruction in function lines
+	LdrIndex  int    // Index of ldr instruction in function lines
+	Label     string // Constant pool label being referenced
+	BaseReg   string // Register used for address calculation
+	DestReg   string // Destination register for the load
 }
 
 // transformStackInstruction transforms pre/post-indexed stack operations to
@@ -286,7 +319,7 @@ func (p *ARM64Parser) Prologue() string {
 // TranslateAssembly implements the full translation pipeline for ARM64
 func (p *ARM64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) error {
 	// Parse assembly
-	assembly, stackSizes, err := p.parseAssembly(t.Assembly, t.TargetOS)
+	assembly, stackSizes, constPools, err := p.parseAssembly(t.Assembly, t.TargetOS)
 	if err != nil {
 		return err
 	}
@@ -320,14 +353,14 @@ func (p *ARM64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) 
 		}
 	}
 
-	// Generate Go assembly
-	return p.generateGoAssembly(t, functions)
+	// Generate Go assembly with constant pools
+	return p.generateGoAssembly(t, functions, constPools)
 }
 
-func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]*arm64Line, map[string]int, error) {
+func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]*arm64Line, map[string]int, map[string]*arm64ConstPool, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer func(file *os.File) {
 		if err = file.Close(); err != nil {
@@ -339,12 +372,75 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 	var (
 		stackSizes   = make(map[string]int)
 		functions    = make(map[string][]*arm64Line)
+		constPools   = make(map[string]*arm64ConstPool)
 		functionName string
 		labelName    string
+		// Constant pool parsing state
+		inLiteralSection  bool
+		currentConstPool  *arm64ConstPool
+		currentConstLabel string
 	)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
+
+		// Check for literal data section
+		if arm64LiteralSection.MatchString(line) {
+			inLiteralSection = true
+			continue
+		}
+
+		// Check for constant pool label (lCPI0_0: or .LCPI0_0:)
+		if arm64ConstPoolLabel.MatchString(line) {
+			// Save previous constant pool if any
+			if currentConstPool != nil && len(currentConstPool.Data) > 0 {
+				constPools[currentConstLabel] = currentConstPool
+			}
+			// Start new constant pool
+			labelPart := strings.Split(line, ":")[0]
+			// Normalize label: strip leading . and l
+			labelPart = strings.TrimPrefix(labelPart, ".")
+			labelPart = strings.TrimPrefix(labelPart, "l")
+			currentConstLabel = labelPart
+			currentConstPool = &arm64ConstPool{
+				Label: labelPart,
+				Data:  make([]uint32, 0),
+			}
+			continue
+		}
+
+		// Parse .long directives for constant pool data
+		if inLiteralSection || currentConstPool != nil {
+			if matches := arm64LongDirective.FindStringSubmatch(line); matches != nil {
+				if currentConstPool != nil {
+					val := parseIntValue(matches[1])
+					currentConstPool.Data = append(currentConstPool.Data, uint32(val))
+					currentConstPool.Size += 4
+				}
+				continue
+			}
+			if matches := arm64QuadDirective.FindStringSubmatch(line); matches != nil {
+				if currentConstPool != nil {
+					val := parseIntValue(matches[1])
+					// Store quad as two 32-bit words (little-endian)
+					currentConstPool.Data = append(currentConstPool.Data, uint32(val), uint32(val>>32))
+					currentConstPool.Size += 8
+				}
+				continue
+			}
+		}
+
+		// Check for section change that exits literal section
+		if strings.HasPrefix(strings.TrimSpace(line), ".section") && !arm64LiteralSection.MatchString(line) {
+			inLiteralSection = false
+			// Save current constant pool if any
+			if currentConstPool != nil && len(currentConstPool.Data) > 0 {
+				constPools[currentConstLabel] = currentConstPool
+				currentConstPool = nil
+				currentConstLabel = ""
+			}
+		}
+
 		if arm64AttributeLine.MatchString(line) {
 			continue
 		} else if arm64LabelLine.MatchString(line) {
@@ -402,10 +498,44 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 		}
 	}
 
-	if err = scanner.Err(); err != nil {
-		return nil, nil, err
+	// Save any remaining constant pool
+	if currentConstPool != nil && len(currentConstPool.Data) > 0 {
+		constPools[currentConstLabel] = currentConstPool
 	}
-	return functions, stackSizes, nil
+
+	if err = scanner.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+	return functions, stackSizes, constPools, nil
+}
+
+// parseIntValue parses a decimal or hex integer value from a string
+func parseIntValue(s string) uint64 {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		val, _ := strconv.ParseUint(s[2:], 16, 64)
+		return val
+	}
+	val, _ := strconv.ParseUint(s, 10, 64)
+	return val
+}
+
+// goRegisterName converts ARM64 register names to Go assembly register names
+// x0-x30 -> R0-R30, w0-w30 -> R0-R30, q0-q31 -> V0-V31, d0-d31 -> V0-V31, s0-s31 -> F0-F31
+func goRegisterName(armReg string) string {
+	armReg = strings.ToLower(armReg)
+	if strings.HasPrefix(armReg, "x") || strings.HasPrefix(armReg, "w") {
+		// General purpose register
+		return "R" + armReg[1:]
+	} else if strings.HasPrefix(armReg, "q") || strings.HasPrefix(armReg, "d") {
+		// NEON vector register
+		return "V" + armReg[1:]
+	} else if strings.HasPrefix(armReg, "s") {
+		// Floating point register (single precision)
+		return "F" + armReg[1:]
+	}
+	// Return as-is if not recognized
+	return strings.ToUpper(armReg)
 }
 
 func (p *ARM64Parser) parseObjectDump(dump string, functions map[string][]*arm64Line, targetOS string) error {
@@ -449,10 +579,24 @@ func (p *ARM64Parser) parseObjectDump(dump string, functions map[string][]*arm64
 	return nil
 }
 
-func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function) error {
+func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function, constPools map[string]*arm64ConstPool) error {
 	var builder strings.Builder
 	builder.WriteString(p.BuildTags())
 	t.writeHeader(&builder)
+
+	// Emit DATA/GLOBL directives for constant pools
+	if len(constPools) > 0 {
+		builder.WriteString("\n// Constant pool data\n")
+		for label, pool := range constPools {
+			// Emit DATA directive with little-endian byte order
+			// Format: DATA symbol<>+offset(SB)/size, $value
+			for i, val := range pool.Data {
+				builder.WriteString(fmt.Sprintf("DATA %s<>+%d(SB)/4, $0x%08x\n", label, i*4, val))
+			}
+			// Emit GLOBL directive to define the symbol size
+			builder.WriteString(fmt.Sprintf("GLOBL %s<>(SB), RODATA|NOPTR, $%d\n", label, pool.Size))
+		}
+	}
 
 	for _, function := range functions {
 		// Calculate return size based on type
@@ -636,11 +780,77 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function)
 		builder.WriteString(argsBuilder.String())
 
 		// Convert interface{} lines back to arm64Line
+		// First pass: find adrp instructions that set up constant pool addresses
+		// and track which register they use
+		constPoolRegs := make(map[string]string) // baseReg -> constLabel
+
 		for _, lineIface := range function.Lines {
 			line, ok := lineIface.(*arm64Line)
 			if !ok {
 				continue
 			}
+			if matches := arm64AdrpConstPool.FindStringSubmatch(line.Assembly); matches != nil {
+				baseReg := strings.ToLower(matches[1])
+				constLabel := "CPI" + matches[2]
+				if _, hasPool := constPools[constLabel]; hasPool {
+					constPoolRegs[baseReg] = constLabel
+				}
+			}
+		}
+
+		for _, lineIface := range function.Lines {
+			line, ok := lineIface.(*arm64Line)
+			if !ok {
+				continue
+			}
+
+			// Skip adrp instructions that reference constant pools (they're no longer needed)
+			if matches := arm64AdrpConstPool.FindStringSubmatch(line.Assembly); matches != nil {
+				constLabel := "CPI" + matches[2]
+				if _, hasPool := constPools[constLabel]; hasPool {
+					// Emit any labels that were on this line
+					for _, label := range line.Labels {
+						builder.WriteString(label)
+						builder.WriteString(":\n")
+					}
+					continue
+				}
+			}
+
+			// Replace ldr instructions that load from constant pools
+			if matches := arm64LdrConstPoolPageoff.FindStringSubmatch(line.Assembly); matches != nil {
+				destReg := matches[1]
+				baseReg := strings.ToLower(matches[2])
+				constLabel := "CPI" + matches[3]
+				if _, hasPool := constPools[constLabel]; hasPool {
+					// Emit any labels
+					for _, label := range line.Labels {
+						builder.WriteString(label)
+						builder.WriteString(":\n")
+					}
+					// Emit load address of constant pool
+					builder.WriteString(fmt.Sprintf("\tMOVD $%s<>(SB), %s\n",
+						constLabel, goRegisterName(baseReg)))
+					// Emit vector/scalar load from the address
+					if strings.HasPrefix(destReg, "q") {
+						// 128-bit vector load
+						vReg := "V" + destReg[1:]
+						builder.WriteString(fmt.Sprintf("\tVLD1 (%s), [%s.B16]\n",
+							goRegisterName(baseReg), vReg))
+					} else if strings.HasPrefix(destReg, "d") {
+						// 64-bit vector load
+						vReg := "V" + destReg[1:]
+						builder.WriteString(fmt.Sprintf("\tVLD1 (%s), [%s.B8]\n",
+							goRegisterName(baseReg), vReg))
+					} else {
+						// Scalar load
+						builder.WriteString(fmt.Sprintf("\tMOVD (%s), %s\n",
+							goRegisterName(baseReg), goRegisterName(destReg)))
+					}
+					continue
+				}
+			}
+
 			for _, label := range line.Labels {
 				builder.WriteString(label)
 				builder.WriteString(":\n")

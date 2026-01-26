@@ -49,6 +49,19 @@ var (
 	amd64CalleeSavePush = regexp.MustCompile(`pushq\s+%(rbx|rbp|r1[2-5])`)
 	// Match "popq %rbx" etc - callee-saved register pop
 	amd64CalleeSavePop = regexp.MustCompile(`popq\s+%(rbx|rbp|r1[2-5])`)
+
+	// Constant pool patterns
+	// Match constant pool labels: .LCPI0_0: (Linux) or LCPI0_0: (macOS)
+	amd64ConstPoolLabel = regexp.MustCompile(`^\.?LCPI\d+_\d+:`)
+	// Match .long directive with hex or decimal value
+	amd64LongDirective = regexp.MustCompile(`^\s+\.long\s+(\d+|0x[0-9a-fA-F]+)`)
+	// Match .quad directive with hex or decimal value
+	amd64QuadDirective = regexp.MustCompile(`^\s+\.quad\s+(\d+|0x[0-9a-fA-F]+)`)
+	// Match section directive for rodata
+	amd64RodataSection = regexp.MustCompile(`^\s+\.section\s+\.rodata|^\s+\.section\s+__TEXT,__const|^\s+\.section\s+__DATA,__const`)
+	// Match RIP-relative memory operand referencing constant pool
+	// Examples: .LCPI0_0(%rip), LCPI0_0(%rip)
+	amd64RIPRelativeConstPool = regexp.MustCompile(`\.?LCPI(\d+_\d+)\(%rip\)`)
 )
 
 // amd64 register sets
@@ -65,6 +78,13 @@ type amd64Line struct {
 	Labels   []string
 	Assembly string
 	Binary   []string
+}
+
+// amd64ConstPool represents a constant pool entry with its label and data
+type amd64ConstPool struct {
+	Label string   // e.g., "CPI0_0" (without leading L or .)
+	Data  []uint32 // Data as 32-bit words (for .long directives)
+	Size  int      // Total size in bytes
 }
 
 func (line *amd64Line) String() string {
@@ -106,6 +126,20 @@ func (line *amd64Line) String() string {
 	}
 	builder.WriteString("\n")
 	return builder.String()
+}
+
+// hasConstPoolRef returns true if this instruction references a constant pool via RIP-relative addressing
+func (line *amd64Line) hasConstPoolRef() bool {
+	return amd64RIPRelativeConstPool.MatchString(line.Assembly)
+}
+
+// getConstPoolLabel extracts the constant pool label from an instruction (e.g., "CPI0_0")
+func (line *amd64Line) getConstPoolLabel() string {
+	matches := amd64RIPRelativeConstPool.FindStringSubmatch(line.Assembly)
+	if len(matches) >= 2 {
+		return "CPI" + matches[1]
+	}
+	return ""
 }
 
 // shouldSkip returns true if this instruction should be removed from output.
@@ -199,7 +233,7 @@ func (p *AMD64Parser) Prologue() string {
 // TranslateAssembly implements the full translation pipeline for AMD64
 func (p *AMD64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) error {
 	// Parse assembly
-	assembly, stackSizes, err := p.parseAssembly(t.Assembly, t.TargetOS)
+	assembly, stackSizes, constPools, err := p.parseAssembly(t.Assembly, t.TargetOS)
 	if err != nil {
 		return err
 	}
@@ -228,14 +262,14 @@ func (p *AMD64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) 
 		}
 	}
 
-	// Generate Go assembly
-	return p.generateGoAssembly(t, functions)
+	// Generate Go assembly with constant pools
+	return p.generateGoAssembly(t, functions, constPools)
 }
 
-func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]*amd64Line, map[string]int, error) {
+func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]*amd64Line, map[string]int, map[string]*amd64ConstPool, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer func(file *os.File) {
 		if err = file.Close(); err != nil {
@@ -247,12 +281,85 @@ func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]
 	var (
 		stackSizes   = make(map[string]int)
 		functions    = make(map[string][]*amd64Line)
+		constPools   = make(map[string]*amd64ConstPool)
 		functionName string
 		labelName    string
+		// Constant pool parsing state
+		inRodataSection   bool
+		currentConstPool  *amd64ConstPool
+		currentConstLabel string
 	)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
+
+		// Check for rodata section
+		if amd64RodataSection.MatchString(line) {
+			inRodataSection = true
+			continue
+		}
+
+		// Check for constant pool label (.LCPI0_0: or LCPI0_0:)
+		if amd64ConstPoolLabel.MatchString(line) {
+			// Save previous constant pool if any
+			if currentConstPool != nil && len(currentConstPool.Data) > 0 {
+				constPools[currentConstLabel] = currentConstPool
+			}
+			// Start new constant pool
+			labelPart := strings.Split(line, ":")[0]
+			// Normalize label: strip leading . and L, keep CPI part
+			labelPart = strings.TrimPrefix(labelPart, ".")
+			labelPart = strings.TrimPrefix(labelPart, "L")
+			currentConstLabel = labelPart
+			currentConstPool = &amd64ConstPool{
+				Label: labelPart,
+				Data:  make([]uint32, 0),
+			}
+			continue
+		}
+
+		// Parse .long directives for constant pool data
+		if inRodataSection || currentConstPool != nil {
+			if matches := amd64LongDirective.FindStringSubmatch(line); matches != nil {
+				if currentConstPool != nil {
+					val := amd64ParseIntValue(matches[1])
+					currentConstPool.Data = append(currentConstPool.Data, uint32(val))
+					currentConstPool.Size += 4
+				}
+				continue
+			}
+			if matches := amd64QuadDirective.FindStringSubmatch(line); matches != nil {
+				if currentConstPool != nil {
+					val := amd64ParseIntValue(matches[1])
+					// Store quad as two 32-bit words (little-endian)
+					currentConstPool.Data = append(currentConstPool.Data, uint32(val), uint32(val>>32))
+					currentConstPool.Size += 8
+				}
+				continue
+			}
+		}
+
+		// Check for section change that exits rodata section
+		if strings.HasPrefix(strings.TrimSpace(line), ".section") && !amd64RodataSection.MatchString(line) {
+			inRodataSection = false
+			// Save current constant pool if any
+			if currentConstPool != nil && len(currentConstPool.Data) > 0 {
+				constPools[currentConstLabel] = currentConstPool
+				currentConstPool = nil
+				currentConstLabel = ""
+			}
+		}
+
+		// Check for .text section which also exits rodata
+		if strings.HasPrefix(strings.TrimSpace(line), ".text") {
+			inRodataSection = false
+			if currentConstPool != nil && len(currentConstPool.Data) > 0 {
+				constPools[currentConstLabel] = currentConstPool
+				currentConstPool = nil
+				currentConstLabel = ""
+			}
+		}
+
 		if amd64AttributeLine.MatchString(line) {
 			continue
 		} else if amd64LabelLine.MatchString(line) {
@@ -304,10 +411,169 @@ func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]
 		}
 	}
 
-	if err = scanner.Err(); err != nil {
-		return nil, nil, err
+	// Save any remaining constant pool
+	if currentConstPool != nil && len(currentConstPool.Data) > 0 {
+		constPools[currentConstLabel] = currentConstPool
 	}
-	return functions, stackSizes, nil
+
+	if err = scanner.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+	return functions, stackSizes, constPools, nil
+}
+
+// amd64ParseIntValue parses a decimal or hex integer value from a string
+func amd64ParseIntValue(s string) uint64 {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		val, _ := strconv.ParseUint(s[2:], 16, 64)
+		return val
+	}
+	val, _ := strconv.ParseUint(s, 10, 64)
+	return val
+}
+
+// amd64RewriteConstPoolRef rewrites an instruction that uses RIP-relative addressing
+// to reference a constant pool, replacing it with Go's static-base addressing.
+// Returns empty string if the instruction pattern is not recognized.
+//
+// Common patterns:
+//   vmovaps .LCPI0_0(%rip), %ymm0  -> VMOVAPS CPI0_0<>(SB), Y0
+//   vmovdqa .LCPI0_0(%rip), %xmm1  -> VMOVDQA CPI0_0<>(SB), X1
+//   vbroadcastss .LCPI0_0(%rip), %ymm0 -> VBROADCASTSS CPI0_0<>(SB), Y0
+//   movq .LCPI0_0(%rip), %xmm0     -> MOVQ CPI0_0<>(SB), X0
+//   leaq .LCPI0_0(%rip), %rax      -> LEAQ CPI0_0<>(SB), AX
+func amd64RewriteConstPoolRef(asm string, constLabel string) string {
+	// Extract instruction mnemonic and operands
+	fields := strings.Fields(asm)
+	if len(fields) < 2 {
+		return ""
+	}
+
+	mnemonic := strings.ToUpper(fields[0])
+	operands := strings.Join(fields[1:], " ")
+
+	// Split operands by comma
+	parts := strings.Split(operands, ",")
+	if len(parts) < 2 {
+		return ""
+	}
+
+	srcOp := strings.TrimSpace(parts[0])
+	dstOp := strings.TrimSpace(parts[1])
+
+	// Check if source operand is the RIP-relative constant pool reference
+	if !amd64RIPRelativeConstPool.MatchString(srcOp) {
+		// Maybe destination is the const pool ref (shouldn't happen for loads, but check)
+		return ""
+	}
+
+	// Convert destination register to Go assembly format
+	goReg := amd64ToGoRegister(dstOp)
+	if goReg == "" {
+		return ""
+	}
+
+	// Build the rewritten instruction
+	// Format: MNEMONIC symbol<>(SB), REGISTER
+	return fmt.Sprintf("\t%s %s<>(SB), %s\t// %s\n", mnemonic, constLabel, goReg, asm)
+}
+
+// amd64ToGoRegister converts an x86-64 AT&T syntax register to Go assembly format
+// Examples: %ymm0 -> Y0, %xmm1 -> X1, %zmm2 -> Z2, %rax -> AX, %eax -> AX
+func amd64ToGoRegister(reg string) string {
+	reg = strings.TrimSpace(reg)
+	if !strings.HasPrefix(reg, "%") {
+		return ""
+	}
+	reg = reg[1:] // Remove % prefix
+
+	// ZMM registers (AVX-512)
+	if strings.HasPrefix(reg, "zmm") {
+		num := reg[3:]
+		return "Z" + num
+	}
+	// YMM registers (AVX)
+	if strings.HasPrefix(reg, "ymm") {
+		num := reg[3:]
+		return "Y" + num
+	}
+	// XMM registers (SSE)
+	if strings.HasPrefix(reg, "xmm") {
+		num := reg[3:]
+		return "X" + num
+	}
+	// 64-bit general purpose registers
+	switch reg {
+	case "rax":
+		return "AX"
+	case "rbx":
+		return "BX"
+	case "rcx":
+		return "CX"
+	case "rdx":
+		return "DX"
+	case "rsi":
+		return "SI"
+	case "rdi":
+		return "DI"
+	case "rbp":
+		return "BP"
+	case "rsp":
+		return "SP"
+	case "r8":
+		return "R8"
+	case "r9":
+		return "R9"
+	case "r10":
+		return "R10"
+	case "r11":
+		return "R11"
+	case "r12":
+		return "R12"
+	case "r13":
+		return "R13"
+	case "r14":
+		return "R14"
+	case "r15":
+		return "R15"
+	}
+	// 32-bit general purpose registers (Go uses same name for 64 and 32 bit access)
+	switch reg {
+	case "eax":
+		return "AX"
+	case "ebx":
+		return "BX"
+	case "ecx":
+		return "CX"
+	case "edx":
+		return "DX"
+	case "esi":
+		return "SI"
+	case "edi":
+		return "DI"
+	case "ebp":
+		return "BP"
+	case "esp":
+		return "SP"
+	case "r8d":
+		return "R8"
+	case "r9d":
+		return "R9"
+	case "r10d":
+		return "R10"
+	case "r11d":
+		return "R11"
+	case "r12d":
+		return "R12"
+	case "r13d":
+		return "R13"
+	case "r14d":
+		return "R14"
+	case "r15d":
+		return "R15"
+	}
+	return ""
 }
 
 func amd64SanitizeAsm(asm string) string {
@@ -371,10 +637,24 @@ func (p *AMD64Parser) parseObjectDump(dump string, functions map[string][]*amd64
 	return nil
 }
 
-func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function) error {
+func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function, constPools map[string]*amd64ConstPool) error {
 	var builder strings.Builder
 	builder.WriteString(p.BuildTags())
 	t.writeHeader(&builder)
+
+	// Emit DATA/GLOBL directives for constant pools
+	if len(constPools) > 0 {
+		builder.WriteString("\n// Constant pool data\n")
+		for label, pool := range constPools {
+			// Emit DATA directive with little-endian byte order
+			// Format: DATA symbol<>+offset(SB)/size, $value
+			for i, val := range pool.Data {
+				builder.WriteString(fmt.Sprintf("DATA %s<>+%d(SB)/4, $0x%08x\n", label, i*4, val))
+			}
+			// Emit GLOBL directive to define the symbol size
+			builder.WriteString(fmt.Sprintf("GLOBL %s<>(SB), RODATA|NOPTR, $%d\n", label, pool.Size))
+		}
+	}
 
 	for _, function := range functions {
 		// Calculate return size based on type
@@ -557,6 +837,23 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function)
 				builder.WriteString(label)
 				builder.WriteString(":\n")
 			}
+
+			// Handle instructions that reference constant pools
+			// RIP-relative addressing won't work, so we replace with static-base loads
+			if line.hasConstPoolRef() {
+				constLabel := line.getConstPoolLabel()
+				if _, hasPool := constPools[constLabel]; hasPool {
+					goAsm := amd64RewriteConstPoolRef(line.Assembly, constLabel)
+					if goAsm != "" {
+						builder.WriteString(goAsm)
+						continue
+					}
+					// If we couldn't rewrite it, emit as comment and continue
+					builder.WriteString(fmt.Sprintf("\t// TODO: rewrite const pool ref: %s\n", line.Assembly))
+					continue
+				}
+			}
+
 			if line.Assembly == "retq" {
 				if len(stack) > 0 {
 					for i := 0; i <= len(stack); i++ {

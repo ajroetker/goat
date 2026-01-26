@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -37,6 +38,18 @@ var (
 	loong64CodeLine      = regexp.MustCompile(`^\s+\w+.+$`)
 	loong64SymbolLine    = regexp.MustCompile(`^\w+\s+<\w+>:$`)
 	loong64DataLine      = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
+
+	// Constant pool patterns
+	// Match constant pool labels: .LCPI0_0:
+	loong64ConstPoolLabel = regexp.MustCompile(`^\.LCPI\d+_\d+:`)
+	// Match .word directive with hex or decimal value (32-bit)
+	loong64WordDirective = regexp.MustCompile(`^\s+\.word\s+(\d+|0x[0-9a-fA-F]+)`)
+	// Match .dword directive with hex or decimal value (64-bit)
+	loong64DwordDirective = regexp.MustCompile(`^\s+\.dword\s+(\d+|0x[0-9a-fA-F]+)`)
+	// Match pcaddu12i instruction referencing constant pool: pcaddu12i $r4, %pc_hi20(.LCPI0_0)
+	loong64PcadduConstPool = regexp.MustCompile(`pcaddu12i\s+(\$\w+),\s*%pc_hi20\(\.LCPI(\d+_\d+)\)`)
+	// Match ld.w/ld.d instruction with constant pool reference: ld.d $r4, $r4, %pc_lo12(.LCPI0_0)
+	loong64LdConstPool = regexp.MustCompile(`ld\.[wd]\s+(\$\w+),\s*(\$\w+),\s*%pc_lo12\(\.LCPI(\d+_\d+)\)`)
 )
 
 // loong64 register sets
@@ -93,6 +106,13 @@ type loong64Line struct {
 	Labels   []string
 	Assembly string
 	Binary   string
+}
+
+// loong64ConstPool represents a constant pool entry with its label and data
+type loong64ConstPool struct {
+	Label string   // e.g., "CPI0_0" (without leading .L)
+	Data  []uint32 // Data as 32-bit words (for .word directives)
+	Size  int      // Total size in bytes
 }
 
 func (line *loong64Line) String() string {
@@ -158,7 +178,7 @@ func (p *Loong64Parser) Prologue() string {
 // TranslateAssembly implements the full translation pipeline for LoongArch64
 func (p *Loong64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) error {
 	// Parse assembly
-	assembly, stackSizes, err := p.parseAssembly(t.Assembly)
+	assembly, stackSizes, constPools, err := p.parseAssembly(t.Assembly)
 	if err != nil {
 		return err
 	}
@@ -187,14 +207,14 @@ func (p *Loong64Parser) TranslateAssembly(t *TranslateUnit, functions []Function
 		}
 	}
 
-	// Generate Go assembly
-	return p.generateGoAssembly(t, functions)
+	// Generate Go assembly with constant pools
+	return p.generateGoAssembly(t, functions, constPools)
 }
 
-func (p *Loong64Parser) parseAssembly(path string) (map[string][]*loong64Line, map[string]int, error) {
+func (p *Loong64Parser) parseAssembly(path string) (map[string][]*loong64Line, map[string]int, map[string]*loong64ConstPool, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer func(file *os.File) {
 		if err = file.Close(); err != nil {
@@ -206,12 +226,63 @@ func (p *Loong64Parser) parseAssembly(path string) (map[string][]*loong64Line, m
 	var (
 		stackSizes   = make(map[string]int)
 		functions    = make(map[string][]*loong64Line)
+		constPools   = make(map[string]*loong64ConstPool)
 		functionName string
 		labelName    string
+		// Constant pool parsing state
+		currentConstPool  *loong64ConstPool
+		currentConstLabel string
 	)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
+
+		// Check for constant pool label (.LCPI0_0:)
+		if loong64ConstPoolLabel.MatchString(line) {
+			// Save previous constant pool if any
+			if currentConstPool != nil && len(currentConstPool.Data) > 0 {
+				constPools[currentConstLabel] = currentConstPool
+			}
+			// Start new constant pool
+			labelPart := strings.Split(line, ":")[0]
+			// Normalize label: strip leading .L to get CPI0_0
+			labelPart = strings.TrimPrefix(labelPart, ".L")
+			currentConstLabel = labelPart
+			currentConstPool = &loong64ConstPool{
+				Label: labelPart,
+				Data:  make([]uint32, 0),
+			}
+			continue
+		}
+
+		// Parse .word directives for constant pool data (32-bit)
+		if currentConstPool != nil {
+			if matches := loong64WordDirective.FindStringSubmatch(line); matches != nil {
+				val := loong64ParseIntValue(matches[1])
+				currentConstPool.Data = append(currentConstPool.Data, uint32(val))
+				currentConstPool.Size += 4
+				continue
+			}
+			// Parse .dword directives for constant pool data (64-bit)
+			if matches := loong64DwordDirective.FindStringSubmatch(line); matches != nil {
+				val := loong64ParseIntValue(matches[1])
+				// Store dword as two 32-bit words (little-endian)
+				currentConstPool.Data = append(currentConstPool.Data, uint32(val), uint32(val>>32))
+				currentConstPool.Size += 8
+				continue
+			}
+		}
+
+		// Check for section change or function start that ends constant pool parsing
+		if loong64NameLine.MatchString(line) || strings.HasPrefix(strings.TrimSpace(line), ".section") {
+			// Save current constant pool if any
+			if currentConstPool != nil && len(currentConstPool.Data) > 0 {
+				constPools[currentConstLabel] = currentConstPool
+				currentConstPool = nil
+				currentConstLabel = ""
+			}
+		}
+
 		if loong64AttributeLine.MatchString(line) {
 			continue
 		} else if loong64NameLine.MatchString(line) {
@@ -241,10 +312,26 @@ func (p *Loong64Parser) parseAssembly(path string) (map[string][]*loong64Line, m
 		}
 	}
 
-	if err = scanner.Err(); err != nil {
-		return nil, nil, err
+	// Save any remaining constant pool
+	if currentConstPool != nil && len(currentConstPool.Data) > 0 {
+		constPools[currentConstLabel] = currentConstPool
 	}
-	return functions, stackSizes, nil
+
+	if err = scanner.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+	return functions, stackSizes, constPools, nil
+}
+
+// loong64ParseIntValue parses a decimal or hex integer value from a string
+func loong64ParseIntValue(s string) uint64 {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		val, _ := strconv.ParseUint(s[2:], 16, 64)
+		return val
+	}
+	val, _ := strconv.ParseUint(s, 10, 64)
+	return val
 }
 
 func (p *Loong64Parser) parseObjectDump(dump string, functions map[string][]*loong64Line) error {
@@ -287,10 +374,38 @@ func (p *Loong64Parser) parseObjectDump(dump string, functions map[string][]*loo
 	return nil
 }
 
-func (p *Loong64Parser) generateGoAssembly(t *TranslateUnit, functions []Function) error {
+// loong64GoRegisterName converts LoongArch register names to Go assembly register names
+// $a0-$a7 -> R4-R11, $t0-$t8 -> R12-R20, etc.
+func loong64GoRegisterName(loongReg string) string {
+	if goReg, ok := loong64RegistersAlias[loongReg]; ok {
+		return goReg
+	}
+	// Handle $rN format directly
+	if strings.HasPrefix(loongReg, "$r") {
+		return "R" + loongReg[2:]
+	}
+	// Return as-is if not recognized
+	return strings.ToUpper(loongReg)
+}
+
+func (p *Loong64Parser) generateGoAssembly(t *TranslateUnit, functions []Function, constPools map[string]*loong64ConstPool) error {
 	var builder strings.Builder
 	builder.WriteString(p.BuildTags())
 	t.writeHeader(&builder)
+
+	// Emit DATA/GLOBL directives for constant pools
+	if len(constPools) > 0 {
+		builder.WriteString("\n// Constant pool data\n")
+		for label, pool := range constPools {
+			// Emit DATA directive with little-endian byte order
+			// Format: DATA symbol<>+offset(SB)/size, $value
+			for i, val := range pool.Data {
+				builder.WriteString(fmt.Sprintf("DATA %s<>+%d(SB)/4, $0x%08x\n", label, i*4, val))
+			}
+			// Emit GLOBL directive to define the symbol size
+			builder.WriteString(fmt.Sprintf("GLOBL %s<>(SB), RODATA|NOPTR, $%d\n", label, pool.Size))
+		}
+	}
 
 	for _, function := range functions {
 		// Calculate return size based on type
@@ -373,6 +488,48 @@ func (p *Loong64Parser) generateGoAssembly(t *TranslateUnit, functions []Functio
 			if !ok {
 				continue
 			}
+
+			// Skip pcaddu12i instructions that reference constant pools (they're no longer needed)
+			if matches := loong64PcadduConstPool.FindStringSubmatch(line.Assembly); matches != nil {
+				constLabel := "CPI" + matches[2]
+				if _, hasPool := constPools[constLabel]; hasPool {
+					// Emit any labels that were on this line
+					for _, label := range line.Labels {
+						builder.WriteString(label)
+						builder.WriteString(":\n")
+					}
+					continue
+				}
+			}
+
+			// Replace ld.w/ld.d instructions that load from constant pools
+			if matches := loong64LdConstPool.FindStringSubmatch(line.Assembly); matches != nil {
+				destReg := matches[1]
+				baseReg := matches[2]
+				constLabel := "CPI" + matches[3]
+				if _, hasPool := constPools[constLabel]; hasPool {
+					// Emit any labels
+					for _, label := range line.Labels {
+						builder.WriteString(label)
+						builder.WriteString(":\n")
+					}
+					// Emit load address of constant pool into the base register
+					builder.WriteString(fmt.Sprintf("\tMOVV $%s<>(SB), %s\n",
+						constLabel, loong64GoRegisterName(baseReg)))
+					// Emit load from the address
+					// Determine if it's a 32-bit or 64-bit load based on the original instruction
+					if strings.Contains(line.Assembly, "ld.d") {
+						builder.WriteString(fmt.Sprintf("\tMOVV (%s), %s\n",
+							loong64GoRegisterName(baseReg), loong64GoRegisterName(destReg)))
+					} else {
+						// ld.w - 32-bit load
+						builder.WriteString(fmt.Sprintf("\tMOVW (%s), %s\n",
+							loong64GoRegisterName(baseReg), loong64GoRegisterName(destReg)))
+					}
+					continue
+				}
+			}
+
 			for _, label := range line.Labels {
 				builder.WriteString(label)
 				builder.WriteString(":\n")
