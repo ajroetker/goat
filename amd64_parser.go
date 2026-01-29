@@ -579,6 +579,9 @@ func amd64ToGoRegister(reg string) string {
 func amd64SanitizeAsm(asm string) string {
 	asm = strings.TrimSpace(asm)
 	asm = strings.Split(asm, "//")[0]
+	// Strip ## comments from objdump output (macOS objdump uses ## for inline comments)
+	// Go's assembler rejects # unless it's the first item on a line.
+	asm = strings.Split(asm, "##")[0]
 	asm = strings.TrimSpace(asm)
 	return asm
 }
@@ -829,14 +832,15 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 				continue
 			}
 
-			// Skip C-style stack management instructions (Go handles the frame)
-			if line.shouldSkip() {
-				continue
-			}
-
+			// Emit labels even for skipped instructions, so jump targets remain valid
 			for _, label := range line.Labels {
 				builder.WriteString(label)
 				builder.WriteString(":\n")
+			}
+
+			// Skip C-style stack management instructions (Go handles the frame)
+			if line.shouldSkip() {
+				continue
 			}
 
 			// Handle instructions that reference constant pools
