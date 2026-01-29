@@ -237,8 +237,12 @@ func (p *ARM64Parser) BuildTarget(goos string) string {
 
 // CompilerFlags returns architecture-specific compiler flags
 func (p *ARM64Parser) CompilerFlags() []string {
-	// ARM64 requires x18 to be reserved (platform register on some OSes)
-	return []string{"-ffixed-x18"}
+	return []string{
+		"-ffixed-x18", // ARM64 platform register (reserved on some OSes)
+		"-ffixed-x26", // Go REGCTXT: closure context register
+		"-ffixed-x27", // Go REGTMP: reserved for linker temporaries
+		"-ffixed-x28", // Go REGG: goroutine pointer (g)
+	}
 }
 
 // Prologue returns C parser prologue for ARM64 NEON types
