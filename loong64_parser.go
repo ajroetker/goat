@@ -197,7 +197,7 @@ func (p *Loong64Parser) TranslateAssembly(t *TranslateUnit, functions []Function
 	// Copy lines to functions
 	for i, fn := range functions {
 		if lines, ok := assembly[fn.Name]; ok {
-			functions[i].Lines = make([]interface{}, len(lines))
+			functions[i].Lines = make([]any, len(lines))
 			for j, line := range lines {
 				functions[i].Lines[j] = line
 			}

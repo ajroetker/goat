@@ -252,7 +252,7 @@ func (p *AMD64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) 
 	// Copy lines to functions
 	for i, fn := range functions {
 		if lines, ok := assembly[fn.Name]; ok {
-			functions[i].Lines = make([]interface{}, len(lines))
+			functions[i].Lines = make([]any, len(lines))
 			for j, line := range lines {
 				functions[i].Lines[j] = line
 			}
@@ -438,11 +438,12 @@ func amd64ParseIntValue(s string) uint64 {
 // Returns empty string if the instruction pattern is not recognized.
 //
 // Common patterns:
-//   vmovaps .LCPI0_0(%rip), %ymm0  -> VMOVAPS CPI0_0<>(SB), Y0
-//   vmovdqa .LCPI0_0(%rip), %xmm1  -> VMOVDQA CPI0_0<>(SB), X1
-//   vbroadcastss .LCPI0_0(%rip), %ymm0 -> VBROADCASTSS CPI0_0<>(SB), Y0
-//   movq .LCPI0_0(%rip), %xmm0     -> MOVQ CPI0_0<>(SB), X0
-//   leaq .LCPI0_0(%rip), %rax      -> LEAQ CPI0_0<>(SB), AX
+//
+//	vmovaps .LCPI0_0(%rip), %ymm0  -> VMOVAPS CPI0_0<>(SB), Y0
+//	vmovdqa .LCPI0_0(%rip), %xmm1  -> VMOVDQA CPI0_0<>(SB), X1
+//	vbroadcastss .LCPI0_0(%rip), %ymm0 -> VBROADCASTSS CPI0_0<>(SB), Y0
+//	movq .LCPI0_0(%rip), %xmm0     -> MOVQ CPI0_0<>(SB), X0
+//	leaq .LCPI0_0(%rip), %rax      -> LEAQ CPI0_0<>(SB), AX
 func amd64RewriteConstPoolRef(asm string, constLabel string) string {
 	// Extract instruction mnemonic and operands
 	fields := strings.Fields(asm)
@@ -689,10 +690,9 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 			// Parameters are placed at 8-byte aligned offsets.
 			// The natural alignment of SIMD types is a hardware concern handled by registers,
 			// not by padding the stack frame.
-			alignTo := 8
-			if sz < 8 {
-				alignTo = sz // Smaller types can use their natural alignment
-			}
+			alignTo := min(sz,
+				// Smaller types can use their natural alignment
+				8)
 			if offset%alignTo != 0 {
 				offset += alignTo - offset%alignTo
 			}
@@ -805,10 +805,7 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 		// Use the larger of: calculated stack offset (for parameter spill) or
 		// detected stack size (from 'subq $N, %rsp' in the compiled assembly).
 		// Go allocates this frame, so we remove the C-generated subq/addq instructions.
-		frameSize := stackOffset
-		if function.StackSize > frameSize {
-			frameSize = function.StackSize
-		}
+		frameSize := max(function.StackSize, stackOffset)
 		// Ensure 16-byte alignment for the frame if we're using C-detected stack size
 		if frameSize > 0 && frameSize%16 != 0 {
 			frameSize += 16 - frameSize%16

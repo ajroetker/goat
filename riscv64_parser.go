@@ -148,7 +148,7 @@ func (p *RISCV64Parser) TranslateAssembly(t *TranslateUnit, functions []Function
 	// Copy lines to functions
 	for i, fn := range functions {
 		if lines, ok := assembly[fn.Name]; ok {
-			functions[i].Lines = make([]interface{}, len(lines))
+			functions[i].Lines = make([]any, len(lines))
 			for j, line := range lines {
 				functions[i].Lines[j] = line
 			}
@@ -544,8 +544,8 @@ func (p *RISCV64Parser) generateGoAssembly(t *TranslateUnit, functions []Functio
 
 			// Replace ld/lw/flw/fld instructions that load from constant pools
 			if matches := riscv64LoadConstPoolPcrel.FindStringSubmatch(line.Assembly); matches != nil {
-				loadOp := matches[1]    // ld, lw, flw, fld
-				destReg := matches[2]   // destination register
+				loadOp := matches[1]  // ld, lw, flw, fld
+				destReg := matches[2] // destination register
 				constLabel := "CPI" + matches[3]
 				baseReg := strings.ToLower(matches[4])
 				if _, hasPool := constPools[constLabel]; hasPool {

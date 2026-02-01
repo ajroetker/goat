@@ -410,10 +410,10 @@ func injectStreamingMode(lines []*arm64Line) []*arm64Line {
 // streaming mode enabled while avoiding redundant smstart calls in loops.
 //
 // The strategy:
-// 1. Find all branch targets from BEFORE firstSVE that have SVE instructions
-//    (these are code paths that bypass the main streaming entry)
-// 2. Inject smstart before firstSVE and before the first SVE in each bypass path
-// 3. Inject smstop before ALL ret instructions
+//  1. Find all branch targets from BEFORE firstSVE that have SVE instructions
+//     (these are code paths that bypass the main streaming entry)
+//  2. Inject smstart before firstSVE and before the first SVE in each bypass path
+//  3. Inject smstop before ALL ret instructions
 //
 // This avoids injecting redundant smstart in loop bodies that are only reached
 // from already-streaming code.
@@ -439,7 +439,7 @@ func injectStreamingModeConservative(lines []*arm64Line, firstSVE int) []*arm64L
 	// - TBZ/TBNZ reg, #bit, label
 	branchPattern := regexp.MustCompile(`(?i)^(?:B(?:\.[A-Z]+|[A-Z]{2})?|CBN?Z|TBN?Z)\s+.*?(\w+)\s*$`)
 
-	for i := 0; i < firstSVE; i++ {
+	for i := range firstSVE {
 		if matches := branchPattern.FindStringSubmatch(lines[i].Assembly); len(matches) > 1 {
 			targetLabel := matches[1]
 			// Handle L prefix: clang generates LBB1_8 but GOAT stores BB1_8
@@ -473,7 +473,6 @@ func injectStreamingModeConservative(lines []*arm64Line, firstSVE int) []*arm64L
 			}
 		}
 	}
-
 
 	result := make([]*arm64Line, 0, len(lines)+10)
 

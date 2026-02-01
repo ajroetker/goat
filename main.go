@@ -328,7 +328,7 @@ type TranslateUnit struct {
 	Go           string
 	Package      string
 	Options      []string
-	IncludePaths []string   // Additional include paths for C parser
+	IncludePaths []string // Additional include paths for C parser
 	Offset       int
 	Target       string     // Target architecture (amd64, arm64, etc.)
 	TargetOS     string     // Target OS (darwin, linux, etc.)
@@ -567,7 +567,7 @@ type Function struct {
 	Position   int
 	Type       string
 	Parameters []Parameter
-	Lines      []interface{} // Architecture-specific line types stored as interface{}
+	Lines      []any // Architecture-specific line types stored as interface{}
 	StackSize  int
 }
 

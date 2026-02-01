@@ -186,6 +186,128 @@ func containsHelper(s, substr string) bool {
 	return false
 }
 
+func TestTransformStackInstruction_PreIndexedSTR(t *testing.T) {
+	// Test single-register pre-indexed STR: str x25, [sp, #-80]!
+	// Original binary: 0xf81b0ff9
+	// STR encoding: imm9 at bits 20:12, mode at bits 11:10
+	// Should transform to unscaled offset: imm9=0, mode=00
+	line := &arm64Line{
+		Assembly: "str\tx25, [sp, #-80]!",
+		Binary:   "f81b0ff9",
+	}
+
+	newBinary, transformed := line.transformStackInstruction()
+	if !transformed {
+		t.Fatal("expected instruction to be transformed")
+	}
+	if newBinary == "" {
+		t.Fatal("expected non-empty binary, got empty (removed)")
+	}
+
+	// Expected: zero imm9 (bits 20-12) and mode (bits 11-10)
+	// 0xf81b0ff9 = 1111 1000 0001 1011 0000 1111 1111 1001
+	// After:       1111 1000 0000 0000 0000 0011 1111 1001 = 0xf80003f9
+	expected := "f80003f9"
+	if newBinary != expected {
+		t.Errorf("expected binary %s, got %s", expected, newBinary)
+	}
+}
+
+func TestTransformStackInstruction_PostIndexedLDR(t *testing.T) {
+	// Test single-register post-indexed LDR: ldr x25, [sp], #80
+	// Original binary: 0xf8450419 -> need to compute actual
+	// LDR post-indexed: imm9 at bits 20:12, mode 01 at bits 11:10
+	// Should transform to unscaled offset: imm9=0, mode=00
+	line := &arm64Line{
+		Assembly: "ldr\tx25, [sp], #80",
+		Binary:   "f84507f9",
+	}
+
+	newBinary, transformed := line.transformStackInstruction()
+	if !transformed {
+		t.Fatal("expected instruction to be transformed")
+	}
+	if newBinary == "" {
+		t.Fatal("expected non-empty binary, got empty (removed)")
+	}
+
+	// Expected: zero imm9 (bits 20-12) and mode (bits 11-10)
+	// Mode was 01, becomes 00; imm9 was non-zero, becomes 0
+	// 0xf84503f9 with imm9 zeroed and mode zeroed
+	expected := "f84003f9"
+	if newBinary != expected {
+		t.Errorf("expected binary %s, got %s", expected, newBinary)
+	}
+}
+
+func TestTransformStackInstruction_PreIndexedSTRWithSpOffset(t *testing.T) {
+	// When SpOffset is set (callee-save in pre-decrement prologue),
+	// the transformed instruction should encode the offset.
+	line := &arm64Line{
+		Assembly: "str\tx25, [sp, #-80]!",
+		Binary:   "f81b0ff9",
+		SpOffset: 432, // sub sp, sp, #432 follows
+	}
+
+	newBinary, transformed := line.transformStackInstruction()
+	if !transformed {
+		t.Fatal("expected instruction to be transformed")
+	}
+
+	// Should encode imm9 = 432 = 0x1b0 at bits 20:12, mode = 00 (unscaled)
+	// 0xf80003f9 base + (0x1b0 << 12) = 0xf81b03f9
+	expected := "f81b03f9"
+	if newBinary != expected {
+		t.Errorf("expected binary %s, got %s", expected, newBinary)
+	}
+}
+
+func TestTransformStackInstruction_PostIndexedLDRWithSpOffset(t *testing.T) {
+	line := &arm64Line{
+		Assembly: "ldr\tx25, [sp], #80",
+		Binary:   "f84507f9",
+		SpOffset: 432,
+	}
+
+	newBinary, transformed := line.transformStackInstruction()
+	if !transformed {
+		t.Fatal("expected instruction to be transformed")
+	}
+
+	// Should encode imm9 = 432 = 0x1b0 at bits 20:12, mode = 00 (unscaled)
+	// Base LDR with opc=01: 0xf84003f9 + (0x1b0 << 12) = 0xf85b03f9
+	expected := "f85b03f9"
+	if newBinary != expected {
+		t.Errorf("expected binary %s, got %s", expected, newBinary)
+	}
+}
+
+func TestString_CalleeSaveWithSpOffset(t *testing.T) {
+	// Regular signed-offset STP with SpOffset should get offset adjusted
+	line := &arm64Line{
+		Assembly: "stp\tx24, x23, [sp, #16]",
+		Binary:   "a9015ff8",
+		SpOffset: 432,
+	}
+
+	output := line.String()
+	if output == "" {
+		t.Fatal("expected non-empty output")
+	}
+	if !contains(output, "[offset adjusted]") {
+		t.Errorf("expected [offset adjusted] marker, got: %s", output)
+	}
+	// Original imm7 = 16/8 = 2, new imm7 = (16+432)/8 = 56 = 0x38
+	// Binary: a9015ff8 -> imm7 at bits 21:15
+	// Original imm7 = 2 (bits 21:15 = 0000010)
+	// New imm7 = 56 (bits 21:15 = 0111000)
+	// a9015ff8 = 1010 1001 0000 0001 0101 1111 1111 1000
+	// After:     1010 1001 0001 1100 0101 1111 1111 1000 = a91c5ff8
+	if !contains(output, "0xa91c5ff8") {
+		t.Errorf("expected adjusted binary 0xa91c5ff8, got: %s", output)
+	}
+}
+
 // Constant pool tests
 
 func TestConstPoolLabelRegex(t *testing.T) {

@@ -43,12 +43,19 @@ var (
 	arm64DataLine   = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
 	// Match stack frame allocation: "sub sp, sp, #N" (with optional hex suffix)
 	arm64StackAllocLine = regexp.MustCompile(`^\s*sub\s+sp,\s*sp,\s*#(\d+)`)
-	// Match pre-decrement stack allocation: "stp ... [sp, #-N]!"
+	// Match pre-decrement stack allocation: "stp ... [sp, #-N]!" or "str ... [sp, #-N]!"
 	arm64StackPreDecLine = regexp.MustCompile(`\[sp,\s*#-(\d+)\]!`)
-	// Match post-increment stack deallocation: "ldp ... [sp], #N"
+	// Match post-increment stack deallocation: "ldp ... [sp], #N" or "ldr ... [sp], #N"
 	arm64StackPostIncLine = regexp.MustCompile(`\[sp\],\s*#(\d+)`)
+	// Match single-register str/ldr (vs pair stp/ldp) for different encoding handling
+	arm64SingleRegLine = regexp.MustCompile(`^\s*(str|ldr)\s+`)
 	// Match explicit stack deallocation: "add sp, sp, #N"
 	arm64StackDeallocLine = regexp.MustCompile(`^\s*add\s+sp,\s*sp,\s*#(\d+)`)
+
+	// Match rdsvl instruction: "rdsvl xN, #M" — reads streaming vector length
+	arm64RdsvlLine = regexp.MustCompile(`^\s*rdsvl\s+x(\d+),\s*#(\d+)`)
+	// Match msub with same source regs: "msub xA, xB, xB, xC" — computes xC - xB*xB
+	arm64MsubSameRegLine = regexp.MustCompile(`^\s*msub\s+x\d+,\s*x(\d+),\s*x(\d+),\s*x\d+`)
 
 	// Constant pool patterns
 	// Match constant pool labels: lCPI0_0:, LCPI0_0:, .LCPI0_0:, .lCPI0_0:, CPI0_0:
@@ -80,6 +87,12 @@ type arm64Line struct {
 	Labels   []string
 	Assembly string
 	Binary   string
+	// SpOffset is added to sp-relative offsets during transformation.
+	// Used when clang emits a pre-decrement prologue (str [sp, #-N]!)
+	// followed by sub sp, sp, #M: callee-save instructions between
+	// the pre-decrement and sub-sp need their offsets shifted up by M
+	// to account for GOAT's merged frame.
+	SpOffset int
 }
 
 // arm64ConstPool represents a constant pool entry with its label and data
@@ -111,18 +124,19 @@ type arm64ConstPoolRef struct {
 //   - add sp, sp, #N          -> (removed, returns empty)
 //
 // ARM64 LDP/STP instruction encoding (64-bit registers):
-//   Bits 31-30: opc (10 for 64-bit)
-//   Bits 29-27: 101 (op0 for LDP/STP)
-//   Bit 26: V (0 for integer, 1 for SIMD)
-//   Bits 25-23: op2 (includes addressing mode)
-//     - 011 = pre-indexed (writeback before)
-//     - 001 = post-indexed (writeback after)
-//     - 010 = signed offset (no writeback)
-//   Bit 22: L (0 for store, 1 for load)
-//   Bits 21-15: imm7 (signed, scaled by 8 for 64-bit)
-//   Bits 14-10: Rt2
-//   Bits 9-5: Rn (base register)
-//   Bits 4-0: Rt
+//
+//	Bits 31-30: opc (10 for 64-bit)
+//	Bits 29-27: 101 (op0 for LDP/STP)
+//	Bit 26: V (0 for integer, 1 for SIMD)
+//	Bits 25-23: op2 (includes addressing mode)
+//	  - 011 = pre-indexed (writeback before)
+//	  - 001 = post-indexed (writeback after)
+//	  - 010 = signed offset (no writeback)
+//	Bit 22: L (0 for store, 1 for load)
+//	Bits 21-15: imm7 (signed, scaled by 8 for 64-bit)
+//	Bits 14-10: Rt2
+//	Bits 9-5: Rn (base register)
+//	Bits 4-0: Rt
 func (line *arm64Line) transformStackInstruction() (string, bool) {
 	asm := line.Assembly
 
@@ -131,39 +145,66 @@ func (line *arm64Line) transformStackInstruction() (string, bool) {
 		return "", true // Remove this instruction
 	}
 
-	// Check for pre-indexed stp/ldp with SP
+	// Check for pre-indexed store with SP
 	if arm64StackPreDecLine.MatchString(asm) {
-		// Parse the binary as hex
 		binary, err := strconv.ParseUint(line.Binary, 16, 32)
 		if err != nil {
 			return "", false
 		}
 
-		// Transform pre-indexed to signed-offset:
-		// - Clear bit 23 (change 011 to 010 in op2)
-		// - Zero out imm7 (bits 21-15)
-		binary &^= (1 << 23)           // Clear bit 23 (pre-indexed -> signed offset)
-		binary &^= (0x7f << 15)        // Zero imm7 (offset = 0)
+		if arm64SingleRegLine.MatchString(asm) {
+			// STR (single register) pre-indexed: bits 11:10 = 11, imm9 at bits 20:12
+			// Transform to unscaled offset with SpOffset applied
+			binary &^= (0x1ff << 12) // Zero imm9 (bits 20-12)
+			binary &^= (3 << 10)     // Change mode 11 -> 00 (unscaled offset, no writeback)
+			if line.SpOffset > 0 {
+				// Encode SpOffset as imm9 (signed, unscaled bytes)
+				imm9 := uint64(line.SpOffset) & 0x1ff
+				binary |= imm9 << 12
+			}
+		} else {
+			// STP (pair) pre-indexed: bits 25:23 = 011, imm7 at bits 21:15
+			// Transform to signed-offset with SpOffset applied
+			binary &^= (1 << 23)    // Clear bit 23 (pre-indexed -> signed offset)
+			binary &^= (0x7f << 15) // Zero imm7
+			if line.SpOffset > 0 {
+				// Encode SpOffset/8 as imm7 (signed, scaled by 8 for 64-bit)
+				imm7 := uint64(line.SpOffset/8) & 0x7f
+				binary |= imm7 << 15
+			}
+		}
 
 		return fmt.Sprintf("%08x", binary), true
 	}
 
-	// Check for post-indexed ldp with SP
+	// Check for post-indexed load with SP
 	if arm64StackPostIncLine.MatchString(asm) {
-		// Parse the binary as hex
 		binary, err := strconv.ParseUint(line.Binary, 16, 32)
 		if err != nil {
 			return "", false
 		}
 
-		// Transform post-indexed to signed-offset:
-		// - Set bit 24, clear bit 23 (change 001 to 010 in op2)
-		// - Zero out imm7 (bits 21-15)
-		binary |= (1 << 24)            // Set bit 24
-		binary &^= (1 << 23)           // Clear bit 23 (post-indexed -> signed offset)
-		binary &^= (0x7f << 15)        // Zero imm7 (offset = 0)
+		if arm64SingleRegLine.MatchString(asm) {
+			// LDR (single register) post-indexed: bits 11:10 = 01, imm9 at bits 20:12
+			// Transform to unscaled offset with SpOffset applied
+			binary &^= (0x1ff << 12) // Zero imm9 (bits 20-12)
+			binary &^= (3 << 10)     // Change mode 01 -> 00 (unscaled offset, no writeback)
+			if line.SpOffset > 0 {
+				imm9 := uint64(line.SpOffset) & 0x1ff
+				binary |= imm9 << 12
+			}
+		} else {
+			// LDP (pair) post-indexed: bits 25:23 = 001, imm7 at bits 21:15
+			// Transform to signed-offset with SpOffset applied
+			binary |= (1 << 24)     // Set bit 24
+			binary &^= (1 << 23)    // Clear bit 23 (post-indexed -> signed offset)
+			binary &^= (0x7f << 15) // Zero imm7
+			if line.SpOffset > 0 {
+				imm7 := uint64(line.SpOffset/8) & 0x7f
+				binary |= imm7 << 15
+			}
+		}
 
-		// Return new binary
 		return fmt.Sprintf("%08x", binary), true
 	}
 
@@ -207,6 +248,40 @@ func (line *arm64Line) String() string {
 		label = strings.TrimPrefix(label, ".")
 		label = strings.TrimPrefix(label, "L")
 		builder.WriteString(fmt.Sprintf("%s %s\n", instruction, label))
+	} else if line.SpOffset > 0 {
+		// Callee-save instruction that needs sp-relative offset adjustment.
+		// This handles signed-offset stp/ldp between the pre-decrement and sub-sp.
+		binary, err := strconv.ParseUint(line.Binary, 16, 32)
+		if err == nil {
+			if arm64SingleRegLine.MatchString(line.Assembly) {
+				// STR/LDR with unsigned offset: imm12 at bits 21:10, scaled by 8 for 64-bit
+				// Bits [31:30] = size, [25:24] = 01 for unsigned offset
+				if (binary>>24)&3 == 1 { // unsigned offset form
+					imm12 := (binary >> 10) & 0xfff
+					scale := 1 << ((binary >> 30) & 3) // size field determines scale
+					newImm12 := imm12 + uint64(line.SpOffset)/uint64(scale)
+					binary &^= 0xfff << 10
+					binary |= (newImm12 & 0xfff) << 10
+				}
+			} else {
+				// STP/LDP signed-offset: imm7 at bits 21:15, scaled by 8 for 64-bit (by 4 for 32-bit)
+				// Add SpOffset/scale to existing imm7
+				scale := 8 // 64-bit registers
+				if (binary>>30)&3 == 0 {
+					scale = 4 // 32-bit registers
+				}
+				imm7 := (binary >> 15) & 0x7f
+				newImm7 := imm7 + uint64(line.SpOffset/scale)
+				binary &^= 0x7f << 15
+				binary |= (newImm7 & 0x7f) << 15
+			}
+		}
+		builder.WriteString("\t")
+		builder.WriteString(fmt.Sprintf("WORD $0x%08x", binary))
+		builder.WriteString("\t// ")
+		builder.WriteString(line.Assembly)
+		builder.WriteString(" [offset adjusted]")
+		builder.WriteString("\n")
 	} else {
 		builder.WriteString("\t")
 		builder.WriteString(fmt.Sprintf("WORD $0x%v", line.Binary))
@@ -323,7 +398,7 @@ func (p *ARM64Parser) Prologue() string {
 // TranslateAssembly implements the full translation pipeline for ARM64
 func (p *ARM64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) error {
 	// Parse assembly
-	assembly, stackSizes, constPools, err := p.parseAssembly(t.Assembly, t.TargetOS)
+	assembly, stackSizes, dynSVLAlloc, constPools, err := p.parseAssembly(t.Assembly, t.TargetOS)
 	if err != nil {
 		return err
 	}
@@ -347,12 +422,21 @@ func (p *ARM64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) 
 	// Copy lines to functions
 	for i, fn := range functions {
 		if lines, ok := assembly[fn.Name]; ok {
-			functions[i].Lines = make([]interface{}, len(lines))
+			functions[i].Lines = make([]any, len(lines))
 			for j, line := range lines {
 				functions[i].Lines[j] = line
 			}
 		}
 		if sz, ok := stackSizes[fn.Name]; ok {
+			// Add dynamic SVL-based stack allocation if detected.
+			// rdsvl+msub allocates SVL^2 bytes at runtime. We must declare
+			// enough frame space for the worst-case SVL. ARM SME allows
+			// SVL up to 256 bytes (2048 bits); Apple M4 uses 64 bytes.
+			// Use 256 bytes as worst case: 256^2 = 65536.
+			if dynSVLAlloc[fn.Name] {
+				const maxSVLBytes = 256 // ARM architectural maximum
+				sz += maxSVLBytes * maxSVLBytes
+			}
 			functions[i].StackSize = sz
 		}
 	}
@@ -361,10 +445,10 @@ func (p *ARM64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) 
 	return p.generateGoAssembly(t, functions, constPools)
 }
 
-func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]*arm64Line, map[string]int, map[string]*arm64ConstPool, error) {
+func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]*arm64Line, map[string]int, map[string]bool, map[string]*arm64ConstPool, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	defer func(file *os.File) {
 		if err = file.Close(); err != nil {
@@ -374,11 +458,14 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 	}(file)
 
 	var (
-		stackSizes   = make(map[string]int)
-		functions    = make(map[string][]*arm64Line)
-		constPools   = make(map[string]*arm64ConstPool)
-		functionName string
-		labelName    string
+		stackSizes     = make(map[string]int)
+		preDecSizes    = make(map[string]int)         // pre-decrement prologue sizes per function
+		hasDynSVLAlloc = make(map[string]bool)        // functions with rdsvl+msub dynamic stack alloc
+		rdsvlRegs      = make(map[string]map[int]int) // funcName -> {regNum: multiplier} from rdsvl
+		functions      = make(map[string][]*arm64Line)
+		constPools     = make(map[string]*arm64ConstPool)
+		functionName   string
+		labelName      string
 		// Constant pool parsing state
 		inLiteralSection  bool
 		currentConstPool  *arm64ConstPool
@@ -473,19 +560,43 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 			asm = strings.TrimSpace(asm)
 
 			// Detect stack frame allocation patterns:
-			// 1. "sub sp, sp, #N" - explicit stack allocation
+			// 1. "sub sp, sp, #N" - explicit stack allocation (cumulative)
 			// 2. "stp ... [sp, #-N]!" - pre-decrement stack allocation
-			// Record the maximum stack size for this function
+			// Sum all sub sp allocations since clang may split the frame
+			// into multiple sub instructions.
+			// Track pre-decrement sizes separately for callee-save offset adjustment.
 			if matches := arm64StackAllocLine.FindStringSubmatch(asm); matches != nil {
 				if size, err := strconv.Atoi(matches[1]); err == nil {
+					stackSizes[functionName] += size
+				}
+			} else if matches := arm64StackPreDecLine.FindStringSubmatch(asm); matches != nil {
+				if size, err := strconv.Atoi(matches[1]); err == nil {
+					preDecSizes[functionName] = size
 					if current, ok := stackSizes[functionName]; !ok || size > current {
 						stackSizes[functionName] = size
 					}
 				}
-			} else if matches := arm64StackPreDecLine.FindStringSubmatch(asm); matches != nil {
-				if size, err := strconv.Atoi(matches[1]); err == nil {
-					if current, ok := stackSizes[functionName]; !ok || size > current {
-						stackSizes[functionName] = size
+			}
+
+			// Detect dynamic SVL-based stack allocation:
+			// rdsvl xN, #M sets xN = SVL * M
+			// msub xA, xN, xN, xB computes xB - xN*xN = sp - (SVL*M)^2
+			// This pattern appears in SME functions that use VLAs.
+			if matches := arm64RdsvlLine.FindStringSubmatch(asm); matches != nil {
+				regNum, _ := strconv.Atoi(matches[1])
+				mult, _ := strconv.Atoi(matches[2])
+				if rdsvlRegs[functionName] == nil {
+					rdsvlRegs[functionName] = make(map[int]int)
+				}
+				rdsvlRegs[functionName][regNum] = mult
+			} else if matches := arm64MsubSameRegLine.FindStringSubmatch(asm); matches != nil {
+				reg1, _ := strconv.Atoi(matches[1])
+				reg2, _ := strconv.Atoi(matches[2])
+				if reg1 == reg2 {
+					if regs, ok := rdsvlRegs[functionName]; ok {
+						if _, hasReg := regs[reg1]; hasReg {
+							hasDynSVLAlloc[functionName] = true
+						}
 					}
 				}
 			}
@@ -508,9 +619,62 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 	}
 
 	if err = scanner.Err(); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	return functions, stackSizes, constPools, nil
+
+	// Adjust callee-save offsets for functions with pre-decrement prologues.
+	// When clang emits: str x25, [sp, #-N]! ; stp ..., [sp, #16] ; sub sp, sp, #M
+	// The stp offsets are relative to sp1 = sp0-N, but GOAT's merged frame puts
+	// sp_go = sp0-(N+M). Callee saves need offsets shifted up by M.
+	// This applies to both prologue saves and epilogue restores.
+	spRelativeLine := regexp.MustCompile(`\[sp,?\s*#?\d*\]`)
+	for fn, preDecSize := range preDecSizes {
+		subSpSize := stackSizes[fn] - preDecSize
+		if subSpSize <= 0 {
+			continue // No sub sp, nothing to adjust
+		}
+
+		lines := functions[fn]
+
+		// Forward pass: mark prologue callee saves (pre-dec through first sub sp)
+		foundPreDec := false
+		for _, line := range lines {
+			if arm64StackPreDecLine.MatchString(line.Assembly) {
+				foundPreDec = true
+				line.SpOffset = subSpSize
+				continue
+			}
+			if foundPreDec {
+				if arm64StackAllocLine.MatchString(line.Assembly) {
+					break // Reached the sub sp, stop
+				}
+				if spRelativeLine.MatchString(line.Assembly) {
+					line.SpOffset = subSpSize
+				}
+			}
+		}
+
+		// Second pass: mark ALL epilogue callee restores (post-inc and preceding ldp).
+		// There may be multiple exit paths (early returns), each with its own epilogue.
+		for i, line := range lines {
+			if arm64StackPostIncLine.MatchString(line.Assembly) {
+				line.SpOffset = subSpSize
+				// Mark preceding ldp instructions (epilogue restores)
+				for j := i - 1; j >= 0; j-- {
+					prev := lines[j]
+					if arm64StackDeallocLine.MatchString(prev.Assembly) {
+						continue // Skip add sp (will be removed)
+					}
+					if !spRelativeLine.MatchString(prev.Assembly) {
+						break // Not an sp-relative instruction, stop
+					}
+					prev.SpOffset = subSpSize
+				}
+			}
+		}
+	}
+
+	return functions, stackSizes, hasDynSVLAlloc, constPools, nil
 }
 
 // parseIntValue parses a decimal or hex integer value from a string
@@ -634,10 +798,9 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 			// Parameters are placed at 8-byte aligned offsets.
 			// The natural alignment of SIMD types is a hardware concern handled by registers,
 			// not by padding the stack frame.
-			alignTo := 8
-			if sz < 8 {
-				alignTo = sz // Smaller types can use their natural alignment
-			}
+			alignTo := min(sz,
+				// Smaller types can use their natural alignment
+				8)
 			// Align offset to parameter boundary
 			if offset%alignTo != 0 {
 				offset += alignTo - offset%alignTo
@@ -650,7 +813,7 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 				is64bit := IsNeon64Type(param.Type)
 
 				if neonRegisterCount+vecCount <= len(arm64NeonRegisters) {
-					for v := 0; v < vecCount; v++ {
+					for v := range vecCount {
 						vecOffset := offset + v*16
 						if is64bit {
 							vecOffset = offset + v*8
@@ -730,7 +893,7 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 					// NEON vector: copy all bytes to stack
 					is64bit := IsNeon64Type(stack[i].B.Type)
 					vecCount := NeonVectorCount(stack[i].B.Type)
-					for v := 0; v < vecCount; v++ {
+					for v := range vecCount {
 						srcOffset := stack[i].A + v*16
 						if is64bit {
 							srcOffset = stack[i].A + v*8
@@ -775,10 +938,7 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 
 		// Use the larger of: calculated stack offset (for parameter spill) or
 		// detected stack size (from 'sub sp, sp, #N' in the compiled assembly)
-		frameSize := stackOffset
-		if function.StackSize > frameSize {
-			frameSize = function.StackSize
-		}
+		frameSize := max(function.StackSize, stackOffset)
 
 		builder.WriteString(fmt.Sprintf("\nTEXT ·%v(SB), $%d-%d\n",
 			function.Name, frameSize, offset+returnSize))
@@ -875,7 +1035,7 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 							is64bit := IsNeon64Type(function.Type)
 							vecCount := NeonVectorCount(function.Type)
 							resultOffset := offset
-							for v := 0; v < vecCount; v++ {
+							for v := range vecCount {
 								vReg := arm64NeonRegisters[v] // V0, V1, V2, V3...
 								if is64bit {
 									// 64-bit vector: extract D[0] only
