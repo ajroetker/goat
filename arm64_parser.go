@@ -41,16 +41,16 @@ var (
 	arm64JmpLine    = regexp.MustCompile(`^(b|b\.\w{2})\t\.?\w+_\d+$`)
 	arm64SymbolLine = regexp.MustCompile(`^\w+\s+<\w+>:$`)
 	arm64DataLine   = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
-	// Match stack frame allocation: "sub sp, sp, #N" (with optional hex suffix)
-	arm64StackAllocLine = regexp.MustCompile(`^\s*sub\s+sp,\s*sp,\s*#(\d+)`)
+	// Match stack frame allocation: "sub sp, sp, #N" with hex or decimal, optional lsl #12
+	arm64StackAllocLine = regexp.MustCompile(`^\s*sub\s+sp,\s*sp,\s*#(0x[0-9a-fA-F]+|\d+)(?:,\s*lsl\s*#(\d+))?`)
 	// Match pre-decrement stack allocation: "stp ... [sp, #-N]!" or "str ... [sp, #-N]!"
 	arm64StackPreDecLine = regexp.MustCompile(`\[sp,\s*#-(\d+)\]!`)
 	// Match post-increment stack deallocation: "ldp ... [sp], #N" or "ldr ... [sp], #N"
 	arm64StackPostIncLine = regexp.MustCompile(`\[sp\],\s*#(\d+)`)
 	// Match single-register str/ldr (vs pair stp/ldp) for different encoding handling
 	arm64SingleRegLine = regexp.MustCompile(`^\s*(str|ldr)\s+`)
-	// Match explicit stack deallocation: "add sp, sp, #N"
-	arm64StackDeallocLine = regexp.MustCompile(`^\s*add\s+sp,\s*sp,\s*#(\d+)`)
+	// Match explicit stack deallocation: "add sp, sp, #N" with hex or decimal, optional lsl #12
+	arm64StackDeallocLine = regexp.MustCompile(`^\s*add\s+sp,\s*sp,\s*#(0x[0-9a-fA-F]+|\d+)(?:,\s*lsl\s*#(\d+))?`)
 
 	// Match rdsvl instruction: "rdsvl xN, #M" — reads streaming vector length
 	arm64RdsvlLine = regexp.MustCompile(`^\s*rdsvl\s+x(\d+),\s*#(\d+)`)
@@ -137,6 +137,30 @@ type arm64ConstPoolRef struct {
 //	Bits 14-10: Rt2
 //	Bits 9-5: Rn (base register)
 //	Bits 4-0: Rt
+// parseArm64Immediate parses a hex or decimal immediate value with an optional
+// left shift. matches[1] is the immediate (e.g. "0x5a0" or "1440"), and
+// shiftStr is the shift amount (e.g. "12" from "lsl #12") or empty.
+func parseArm64Immediate(immStr, shiftStr string) (int, error) {
+	var val int64
+	var err error
+	if strings.HasPrefix(immStr, "0x") || strings.HasPrefix(immStr, "0X") {
+		val, err = strconv.ParseInt(immStr[2:], 16, 64)
+	} else {
+		val, err = strconv.ParseInt(immStr, 10, 64)
+	}
+	if err != nil {
+		return 0, err
+	}
+	if shiftStr != "" {
+		shift, err := strconv.Atoi(shiftStr)
+		if err != nil {
+			return 0, err
+		}
+		val <<= shift
+	}
+	return int(val), nil
+}
+
 func (line *arm64Line) transformStackInstruction() (string, bool) {
 	asm := line.Assembly
 
@@ -566,7 +590,7 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 			// into multiple sub instructions.
 			// Track pre-decrement sizes separately for callee-save offset adjustment.
 			if matches := arm64StackAllocLine.FindStringSubmatch(asm); matches != nil {
-				if size, err := strconv.Atoi(matches[1]); err == nil {
+				if size, err := parseArm64Immediate(matches[1], matches[2]); err == nil {
 					stackSizes[functionName] += size
 				}
 			} else if matches := arm64StackPreDecLine.FindStringSubmatch(asm); matches != nil {
@@ -669,6 +693,58 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 						break // Not an sp-relative instruction, stop
 					}
 					prev.SpOffset = subSpSize
+				}
+			}
+		}
+	}
+
+	// Adjust sp-relative offsets for functions with multiple sub-sp prologues.
+	// When clang splits the frame into multiple sub sp instructions:
+	//   sub sp, sp, #A    ; first allocation (callee-save region)
+	//   <callee saves>    ; offsets relative to sp = orig - A
+	//   sub sp, sp, #B    ; additional allocation(s)
+	//   <body>            ; offsets relative to sp = orig - A - B
+	//   add sp, sp, #B    ; epilogue reversal
+	//   <callee restores> ; offsets relative to sp = orig - A
+	//   add sp, sp, #A    ; final deallocation
+	// GOAT merges all sub/add sp into a single TEXT $A+B, making sp = orig-(A+B)
+	// throughout. Instructions in callee-save regions (where running delta != total)
+	// need their sp-relative offsets shifted by (total - running_delta).
+	for fn, totalSize := range stackSizes {
+		if _, hasPreDec := preDecSizes[fn]; hasPreDec {
+			continue // Already handled by pre-decrement logic above
+		}
+		lines := functions[fn]
+		if len(lines) == 0 {
+			continue
+		}
+
+		// Count sub sp instructions to detect multi-sub prologues
+		subSpCount := 0
+		for _, line := range lines {
+			if arm64StackAllocLine.MatchString(line.Assembly) {
+				subSpCount++
+			}
+		}
+		if subSpCount < 2 {
+			continue
+		}
+
+		// Track running sp delta and adjust sp-relative instructions
+		// that are not at the final sp level.
+		runningDelta := 0
+		for _, line := range lines {
+			if matches := arm64StackAllocLine.FindStringSubmatch(line.Assembly); matches != nil {
+				if size, err := parseArm64Immediate(matches[1], matches[2]); err == nil {
+					runningDelta += size
+				}
+			} else if matches := arm64StackDeallocLine.FindStringSubmatch(line.Assembly); matches != nil {
+				if size, err := parseArm64Immediate(matches[1], matches[2]); err == nil {
+					runningDelta -= size
+				}
+			} else if runningDelta > 0 && runningDelta < totalSize {
+				if spRelativeLine.MatchString(line.Assembly) {
+					line.SpOffset = totalSize - runningDelta
 				}
 			}
 		}
@@ -939,6 +1015,10 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 		// Use the larger of: calculated stack offset (for parameter spill) or
 		// detected stack size (from 'sub sp, sp, #N' in the compiled assembly)
 		frameSize := max(function.StackSize, stackOffset)
+		// Ensure 16-byte alignment for the frame (required by Go assembler on ARM64)
+		if frameSize > 0 && frameSize%16 != 0 {
+			frameSize += 16 - frameSize%16
+		}
 
 		builder.WriteString(fmt.Sprintf("\nTEXT ·%v(SB), $%d-%d\n",
 			function.Name, frameSize, offset+returnSize))
