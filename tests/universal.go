@@ -4,7 +4,7 @@
 // 	clang   21.1.8
 // 	objdump 2.45.1
 // flags: -O0
-// source: src/universal.c
+// source: tests/src/universal.c
 
 package tests
 

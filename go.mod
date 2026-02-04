@@ -6,7 +6,6 @@ require (
 	github.com/klauspost/asmfmt v1.3.2
 	github.com/samber/lo v1.50.0
 	github.com/spf13/cobra v1.7.0
-	golang.org/x/sys v0.34.0
 	modernc.org/cc/v4 v4.26.3
 )
 

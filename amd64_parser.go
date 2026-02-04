@@ -679,10 +679,12 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 		var argsBuilder strings.Builder
 
 		for _, param := range function.Parameters {
-			sz := 8
+			sz := 8 // Default 8-byte slot
 			if !param.Pointer {
 				if simdSz := X86SIMDTypeSize(param.Type); simdSz > 0 {
 					sz = simdSz
+				} else if param.Type == "float" {
+					sz = 4 // float32 is 4 bytes
 				}
 			}
 
@@ -773,6 +775,13 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 				}
 			}
 			offset += sz
+		}
+
+		// Align result offset to pointer size (8 bytes) for Go ABI0.
+		// Go packs arguments with natural alignment, but the result
+		// section starts at the next pointer-aligned boundary.
+		if offset%8 != 0 {
+			offset += 8 - offset%8
 		}
 
 		hasSIMD := false
