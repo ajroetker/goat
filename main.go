@@ -25,7 +25,6 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"golang.org/x/sys/cpu"
 	"modernc.org/cc/v4"
 )
 
@@ -374,8 +373,8 @@ func (t *TranslateUnit) parseSource() ([]Function, error) {
 		cfg.SysIncludePaths = append(t.IncludePaths, cfg.SysIncludePaths...)
 	}
 	var prologue strings.Builder
-	// Add RISC-V vector support if available
-	if t.Target == "riscv64" && cpu.RISCV64.HasV {
+	// Add RISC-V vector type definitions for the C parser
+	if t.Target == "riscv64" {
 		prologue.WriteString("#define __riscv_vector 1\n")
 		for _, typeStr := range []string{"int64", "uint64", "int32", "uint32", "int16", "uint16", "int8", "uint8", "float64", "float32", "float16"} {
 			for i := 1; i <= 8; i *= 2 {

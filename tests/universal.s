@@ -4,7 +4,7 @@
 // 	clang   21.1.8
 // 	objdump 2.45.1
 // flags: -O0
-// source: src/universal.c
+// source: tests/src/universal.c
 
 TEXT ·add(SB), $0-24
 	MOVD a+0(FP), R0
@@ -30,16 +30,16 @@ TEXT ·l2(SB), $0-28
 	WORD $0x2f00e400  // movi	d0, #0000000000000000
 	WORD $0xbd0017e0  // str	s0, [sp, #20]
 	WORD $0xb90013ff  // str	wzr, [sp, #16]
-	B    LBB1_1
+	B    BB1_1
 
-LBB1_1:
+BB1_1:
 	WORD $0xb98013e8 // ldrsw	x8, [sp, #16]
 	WORD $0xf9400fe9 // ldr	x9, [sp, #24]
 	WORD $0xeb090108 // subs	x8, x8, x9
-	BGE  LBB1_4
-	B    LBB1_2
+	BGE  BB1_4
+	B    BB1_2
 
-LBB1_2:
+BB1_2:
 	WORD $0xf94017e8 // ldr	x8, [sp, #40]
 	WORD $0xb98013e9 // ldrsw	x9, [sp, #16]
 	WORD $0xbc697900 // ldr	s0, [x8, x9, lsl #2]
@@ -56,15 +56,15 @@ LBB1_2:
 	WORD $0xbd4017e0 // ldr	s0, [sp, #20]
 	WORD $0x1e212800 // fadd	s0, s0, s1
 	WORD $0xbd0017e0 // str	s0, [sp, #20]
-	B    LBB1_3
+	B    BB1_3
 
-LBB1_3:
+BB1_3:
 	WORD $0xb94013e8 // ldr	w8, [sp, #16]
 	WORD $0x11000508 // add	w8, w8, #1
 	WORD $0xb90013e8 // str	w8, [sp, #16]
-	B    LBB1_1
+	B    BB1_1
 
-LBB1_4:
+BB1_4:
 	WORD  $0xbd4017e0       // ldr	s0, [sp, #20]
 	WORD  $0x9100c3ff       // add	sp, sp, #48
 	FMOVS F0, result+24(FP)
@@ -85,40 +85,40 @@ TEXT ·mat_mul(SB), $0-48
 	WORD $0xf9000fe4    // str	x4, [sp, #24]
 	WORD $0xf9000be5    // str	x5, [sp, #16]
 	WORD $0xb9000fff    // str	wzr, [sp, #12]
-	B    LBB2_1
+	B    BB2_1
 
-LBB2_1:
+BB2_1:
 	WORD $0xb9800fe8 // ldrsw	x8, [sp, #12]
 	WORD $0xf94013e9 // ldr	x9, [sp, #32]
 	WORD $0xeb090108 // subs	x8, x8, x9
-	BGE  LBB2_12
-	B    LBB2_2
+	BGE  BB2_12
+	B    BB2_2
 
-LBB2_2:
+BB2_2:
 	WORD $0xb9000bff // str	wzr, [sp, #8]
-	B    LBB2_3
+	B    BB2_3
 
-LBB2_3:
+BB2_3:
 	WORD $0xb9800be8 // ldrsw	x8, [sp, #8]
 	WORD $0xf9400be9 // ldr	x9, [sp, #16]
 	WORD $0xeb090108 // subs	x8, x8, x9
-	BGE  LBB2_10
-	B    LBB2_4
+	BGE  BB2_10
+	B    BB2_4
 
-LBB2_4:
+BB2_4:
 	WORD $0x2f00e400 // movi	d0, #0000000000000000
 	WORD $0xbd0007e0 // str	s0, [sp, #4]
 	WORD $0xb90003ff // str	wzr, [sp]
-	B    LBB2_5
+	B    BB2_5
 
-LBB2_5:
+BB2_5:
 	WORD $0xb98003e8 // ldrsw	x8, [sp]
 	WORD $0xf9400fe9 // ldr	x9, [sp, #24]
 	WORD $0xeb090108 // subs	x8, x8, x9
-	BGE  LBB2_8
-	B    LBB2_6
+	BGE  BB2_8
+	B    BB2_6
 
-LBB2_6:
+BB2_6:
 	WORD $0xf9401fe8 // ldr	x8, [sp, #56]
 	WORD $0xb9800fe9 // ldrsw	x9, [sp, #12]
 	WORD $0xf9400fea // ldr	x10, [sp, #24]
@@ -136,15 +136,15 @@ LBB2_6:
 	WORD $0xbd4007e2 // ldr	s2, [sp, #4]
 	WORD $0x1f010800 // fmadd	s0, s0, s1, s2
 	WORD $0xbd0007e0 // str	s0, [sp, #4]
-	B    LBB2_7
+	B    BB2_7
 
-LBB2_7:
+BB2_7:
 	WORD $0xb94003e8 // ldr	w8, [sp]
 	WORD $0x11000508 // add	w8, w8, #1
 	WORD $0xb90003e8 // str	w8, [sp]
-	B    LBB2_5
+	B    BB2_5
 
-LBB2_8:
+BB2_8:
 	WORD $0xbd4007e0 // ldr	s0, [sp, #4]
 	WORD $0xf94017e8 // ldr	x8, [sp, #40]
 	WORD $0xb9800fe9 // ldrsw	x9, [sp, #12]
@@ -153,24 +153,24 @@ LBB2_8:
 	WORD $0xb9800bea // ldrsw	x10, [sp, #8]
 	WORD $0x8b0a0129 // add	x9, x9, x10
 	WORD $0xbc297900 // str	s0, [x8, x9, lsl #2]
-	B    LBB2_9
+	B    BB2_9
 
-LBB2_9:
+BB2_9:
 	WORD $0xb9400be8 // ldr	w8, [sp, #8]
 	WORD $0x11000508 // add	w8, w8, #1
 	WORD $0xb9000be8 // str	w8, [sp, #8]
-	B    LBB2_3
+	B    BB2_3
 
-LBB2_10:
-	B LBB2_11
+BB2_10:
+	B BB2_11
 
-LBB2_11:
+BB2_11:
 	WORD $0xb9400fe8 // ldr	w8, [sp, #12]
 	WORD $0x11000508 // add	w8, w8, #1
 	WORD $0xb9000fe8 // str	w8, [sp, #12]
-	B    LBB2_1
+	B    BB2_1
 
-LBB2_12:
+BB2_12:
 	WORD $0x910103ff // add	sp, sp, #64
 	RET
 
