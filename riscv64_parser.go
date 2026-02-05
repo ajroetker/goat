@@ -101,7 +101,12 @@ func (p *RISCV64Parser) CompilerFlags() []string {
 
 // Prologue returns C parser prologue (empty for RISC-V - no special types)
 func (p *RISCV64Parser) Prologue() string {
-	return ""
+	var prologue strings.Builder
+	// Define include guards so real system intrinsic headers are skipped.
+	prologue.WriteString("#define GOAT_PARSER 1\n")
+	prologue.WriteString("#define _RISCV_VECTOR_H 1\n")     // riscv_vector.h
+	prologue.WriteString("#define __RISCV_VECTOR_H 1\n")     // alternative guard
+	return prologue.String()
 }
 
 // TranslateAssembly implements the full translation pipeline for RISC-V 64-bit

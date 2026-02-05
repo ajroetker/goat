@@ -111,6 +111,16 @@ func (p *ARM64Parser) Prologue() string {
 	var prologue strings.Builder
 	// Define GOAT_PARSER to skip includes during parsing
 	prologue.WriteString("#define GOAT_PARSER 1\n")
+	// Define include guards so real system headers are skipped during parsing.
+	// The modernc.org C parser can't handle GCC/Clang builtins in these headers.
+	// All NEON/SVE types are provided as typedefs below instead.
+	prologue.WriteString("#define _AARCH64_NEON_H_\n")   // GCC arm_neon.h
+	prologue.WriteString("#define __ARM_NEON_H 1\n")     // Clang arm_neon.h
+	prologue.WriteString("#define _ARM_NEON_H_ 1\n")     // alternative arm_neon.h
+	prologue.WriteString("#define _AARCH64_SVE_H_\n")    // GCC arm_sve.h
+	prologue.WriteString("#define __ARM_SVE_H 1\n")      // Clang arm_sve.h
+	prologue.WriteString("#define _ARM_FP16_H_ 1\n")     // arm_fp16.h
+	prologue.WriteString("#define _ARM_BF16_H_ 1\n")     // arm_bf16.h
 
 	// Define __bf16 for arm_bf16.h (compiler built-in type)
 	prologue.WriteString("typedef short __bf16;\n")
