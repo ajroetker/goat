@@ -327,13 +327,14 @@ type TranslateUnit struct {
 	Package      string
 	Options      []string
 	IncludePaths []string   // Additional include paths for C parser
+	Sysroot      string     // Explicit sysroot path for cross-compilation
 	Offset       int
 	Target       string     // Target architecture (amd64, arm64, etc.)
 	TargetOS     string     // Target OS (darwin, linux, etc.)
 	parser       ArchParser // Architecture-specific parser
 }
 
-func NewTranslateUnit(source string, outputDir string, target string, targetOS string, includePaths []string, options ...string) (TranslateUnit, error) {
+func NewTranslateUnit(source string, outputDir string, target string, targetOS string, includePaths []string, sysroot string, options ...string) (TranslateUnit, error) {
 	sourceExt := filepath.Ext(source)
 	noExtSourcePath := source[:len(source)-len(sourceExt)]
 	noExtSourceBase := filepath.Base(noExtSourcePath)
@@ -352,6 +353,7 @@ func NewTranslateUnit(source string, outputDir string, target string, targetOS s
 		Package:      filepath.Base(outputDir),
 		Options:      options,
 		IncludePaths: includePaths,
+		Sysroot:      sysroot,
 		Target:       target,
 		TargetOS:     targetOS,
 		parser:       parser,
@@ -487,6 +489,17 @@ func (t *TranslateUnit) compile(args ...string) error {
 	// Add architecture-specific compiler flags
 	args = append(args, t.parser.CompilerFlags()...)
 
+	// Cross-compilation sysroot: explicit --sysroot flag > auto-detect
+	if !argsContainSysroot(args) {
+		sysroot := t.Sysroot
+		if sysroot == "" && (t.Target != runtime.GOARCH || t.TargetOS != runtime.GOOS) {
+			sysroot = detectCrossCompileSysroot(t.Target, t.TargetOS)
+		}
+		if sysroot != "" {
+			args = append(args, "--sysroot="+sysroot)
+		}
+	}
+
 	target := t.parser.BuildTarget(t.TargetOS)
 	_, err := runCommand("clang", append([]string{"-S", "-target", target, "-c", t.Source, "-o", t.Assembly}, args...)...)
 	if err != nil {
@@ -494,6 +507,114 @@ func (t *TranslateUnit) compile(args ...string) error {
 	}
 	_, err = runCommand("clang", append([]string{"-target", target, "-c", t.Assembly, "-o", t.Object}, args...)...)
 	return err
+}
+
+// argsContainSysroot checks whether --sysroot is already present in the compiler args
+// (e.g. passed via -e/--extra-option).
+func argsContainSysroot(args []string) bool {
+	for _, arg := range args {
+		if arg == "--sysroot" || strings.HasPrefix(arg, "--sysroot=") {
+			return true
+		}
+	}
+	return false
+}
+
+// detectCrossCompileSysroot auto-detects the sysroot path for cross-compilation.
+// Returns empty string if no sysroot is found.
+func detectCrossCompileSysroot(targetArch, targetOS string) string {
+	switch runtime.GOOS {
+	case "linux":
+		return detectLinuxSysroot(targetArch, targetOS)
+	case "darwin":
+		return detectDarwinSysroot(targetArch, targetOS)
+	case "windows":
+		return detectWindowsSysroot(targetArch, targetOS)
+	default:
+		return ""
+	}
+}
+
+// detectLinuxSysroot probes Debian/Ubuntu and Fedora/RHEL cross-compilation sysroot paths.
+func detectLinuxSysroot(targetArch, targetOS string) string {
+	if targetOS != "linux" {
+		return ""
+	}
+
+	archToGNUPrefix := map[string]string{
+		"arm64":   "aarch64-linux-gnu",
+		"amd64":   "x86_64-linux-gnu",
+		"riscv64": "riscv64-linux-gnu",
+		"loong64": "loongarch64-linux-gnu",
+	}
+
+	prefix, ok := archToGNUPrefix[targetArch]
+	if !ok {
+		return ""
+	}
+
+	// Debian/Ubuntu/Arch: /usr/{triplet}/
+	sysroot := "/usr/" + prefix
+	if _, err := os.Stat(filepath.Join(sysroot, "include")); err == nil {
+		return sysroot
+	}
+
+	// Fedora/RHEL: /usr/{triplet}/sys-root/
+	sysroot = "/usr/" + prefix + "/sys-root"
+	if _, err := os.Stat(filepath.Join(sysroot, "usr", "include")); err == nil {
+		return sysroot
+	}
+
+	return ""
+}
+
+// detectDarwinSysroot uses xcrun to locate the macOS SDK for cross-arch compilation.
+func detectDarwinSysroot(targetArch, targetOS string) string {
+	if targetOS != "darwin" {
+		return ""
+	}
+
+	out, err := exec.Command("xcrun", "--show-sdk-path").Output()
+	if err != nil {
+		return ""
+	}
+
+	sdkPath := strings.TrimSpace(string(out))
+	if _, err := os.Stat(sdkPath); err == nil {
+		return sdkPath
+	}
+
+	return ""
+}
+
+// detectWindowsSysroot probes standard MSYS2/MinGW install locations.
+func detectWindowsSysroot(targetArch, targetOS string) string {
+	if targetOS != "windows" {
+		return ""
+	}
+
+	var candidates []string
+	switch targetArch {
+	case "amd64":
+		candidates = []string{
+			`C:\msys64\mingw64`,
+			`C:\msys64\clang64`,
+		}
+	case "arm64":
+		candidates = []string{
+			`C:\msys64\clangarm64`,
+		}
+	default:
+		return ""
+	}
+
+	for _, c := range candidates {
+		if _, err := os.Stat(filepath.Join(c, "include")); err == nil {
+			return c
+		}
+	}
+
+	return ""
 }
 
 func (t *TranslateUnit) Translate() error {
@@ -704,7 +825,8 @@ var command = &cobra.Command{
 		optimizeLevel, _ := cmd.PersistentFlags().GetInt("optimize-level")
 		options = append(options, fmt.Sprintf("-O%d", optimizeLevel))
 		includePaths, _ := cmd.PersistentFlags().GetStringSlice("include-path")
-		file, err := NewTranslateUnit(args[0], output, target, targetOS, includePaths, options...)
+		sysroot, _ := cmd.PersistentFlags().GetString("sysroot")
+		file, err := NewTranslateUnit(args[0], output, target, targetOS, includePaths, sysroot, options...)
 		if err != nil {
 			_, _ = fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -725,6 +847,7 @@ func init() {
 	command.PersistentFlags().StringP("target", "t", runtime.GOARCH, "target architecture (amd64, arm64, loong64, riscv64)")
 	command.PersistentFlags().String("target-os", runtime.GOOS, "target operating system (darwin, linux, windows)")
 	command.PersistentFlags().StringSliceP("include-path", "I", nil, "additional include path for C parser (for cross-compilation)")
+	command.PersistentFlags().String("sysroot", "", "sysroot path for cross-compilation (passed as --sysroot to clang)")
 }
 
 func main() {
