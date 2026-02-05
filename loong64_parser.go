@@ -172,7 +172,12 @@ func (p *Loong64Parser) CompilerFlags() []string {
 
 // Prologue returns C parser prologue for architecture-specific types
 func (p *Loong64Parser) Prologue() string {
-	return "" // LoongArch64 doesn't have special vector types to define
+	var prologue strings.Builder
+	prologue.WriteString("#define GOAT_PARSER 1\n")
+	// Define include guards for LoongArch SIMD headers
+	prologue.WriteString("#define _LSXINTRIN_H 1\n")   // LSX (128-bit SIMD)
+	prologue.WriteString("#define _LASXINTRIN_H 1\n")   // LASX (256-bit SIMD)
+	return prologue.String()
 }
 
 // TranslateAssembly implements the full translation pipeline for LoongArch64

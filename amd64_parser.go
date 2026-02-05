@@ -200,11 +200,13 @@ func (p *AMD64Parser) Prologue() string {
 	prologue.WriteString("#endif\n")
 	// Define GOAT_PARSER to skip includes during parsing
 	prologue.WriteString("#define GOAT_PARSER 1\n")
-	// Skip problematic AVX-512 FP16 headers that use __builtin_bit_cast and _Float16 _Complex.
-	// These headers are included by immintrin.h but contain syntax the C parser can't handle.
-	// Define the header guards so the headers are skipped when immintrin.h tries to include them.
-	prologue.WriteString("#define __AVX512FP16INTRIN_H\n")
-	prologue.WriteString("#define __AVX512VLFP16INTRIN_H\n")
+	// Define include guards so real system intrinsic headers are skipped.
+	// The modernc.org C parser can't handle GCC/Clang builtins in these headers.
+	// All x86 SIMD types are provided as typedefs below instead.
+	prologue.WriteString("#define _IMMINTRIN_H_INCLUDED\n")   // GCC immintrin.h
+	prologue.WriteString("#define __IMMINTRIN_H 1\n")         // Clang immintrin.h
+	prologue.WriteString("#define __AVX512FP16INTRIN_H\n")    // AVX-512 FP16
+	prologue.WriteString("#define __AVX512VLFP16INTRIN_H\n")  // AVX-512 VL FP16
 	// Define scalar half-precision types for the parser
 	prologue.WriteString("typedef unsigned short __bf16;\n")   // BF16 scalar
 	prologue.WriteString("typedef unsigned short _Float16;\n") // FP16 scalar
