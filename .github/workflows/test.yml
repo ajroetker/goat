@@ -11,7 +11,7 @@ jobs:
     name: ubuntu-latest
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - uses: actions/setup-go@v4
       - name: Install clang
         uses: ConorMacBride/install-package@v1
@@ -28,7 +28,7 @@ jobs:
     name: ubuntu-24.04-arm
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - uses: actions/setup-go@v4
       - name: Install clang
         uses: ConorMacBride/install-package@v1
@@ -45,7 +45,7 @@ jobs:
     name: macos-latest
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - uses: actions/setup-go@v4
         with:
           go-version: stable
@@ -64,7 +64,7 @@ jobs:
     name: windows-latest
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - uses: actions/setup-go@v4
       - name: Install LLVM and MinGW-w64
         uses: ConorMacBride/install-package@v1

@@ -199,21 +199,15 @@ func (p *Loong64Parser) TranslateAssembly(t *TranslateUnit, functions []Function
 		return err
 	}
 
-	// Copy lines to functions
+	// Copy stack sizes to functions
 	for i, fn := range functions {
-		if lines, ok := assembly[fn.Name]; ok {
-			functions[i].Lines = make([]any, len(lines))
-			for j, line := range lines {
-				functions[i].Lines[j] = line
-			}
-		}
 		if sz, ok := stackSizes[fn.Name]; ok {
 			functions[i].StackSize = sz
 		}
 	}
 
 	// Generate Go assembly with constant pools
-	return p.generateGoAssembly(t, functions, constPools)
+	return p.generateGoAssembly(t, functions, assembly, constPools)
 }
 
 func (p *Loong64Parser) parseAssembly(path string) (map[string][]*loong64Line, map[string]int, map[string]*loong64ConstPool, error) {
@@ -393,7 +387,7 @@ func loong64GoRegisterName(loongReg string) string {
 	return strings.ToUpper(loongReg)
 }
 
-func (p *Loong64Parser) generateGoAssembly(t *TranslateUnit, functions []Function, constPools map[string]*loong64ConstPool) error {
+func (p *Loong64Parser) generateGoAssembly(t *TranslateUnit, functions []Function, assembly map[string][]*loong64Line, constPools map[string]*loong64ConstPool) error {
 	var builder strings.Builder
 	builder.WriteString(p.BuildTags())
 	t.writeHeader(&builder)
@@ -440,10 +434,14 @@ func (p *Loong64Parser) generateGoAssembly(t *TranslateUnit, functions []Functio
 			if offset%sz != 0 {
 				offset += sz - offset%sz
 			}
-			if !param.Pointer && (param.Type == "double" || param.Type == "float") {
+			if !param.Pointer && (param.Type == "double" || param.Type == "float" || param.Type == "float16_t") {
 				if fpRegisterCount < len(loong64FPRegisters) {
 					if param.Type == "double" {
 						builder.WriteString(fmt.Sprintf("\tMOVD %s+%d(FP), %s\n", param.Name, offset, loong64FPRegisters[fpRegisterCount]))
+					} else if param.Type == "float16_t" {
+						// Load 16-bit to GP register, then move to FP register
+						builder.WriteString(fmt.Sprintf("\tMOVH %s+%d(FP), R12\n", param.Name, offset))
+						builder.WriteString(fmt.Sprintf("\tMOVF R12, %s\n", loong64FPRegisters[fpRegisterCount]))
 					} else {
 						builder.WriteString(fmt.Sprintf("\tMOVF %s+%d(FP), %s\n", param.Name, offset, loong64FPRegisters[fpRegisterCount]))
 					}
@@ -488,13 +486,7 @@ func (p *Loong64Parser) generateGoAssembly(t *TranslateUnit, functions []Functio
 			}
 		}
 
-		// Convert interface{} lines back to loong64Line
-		for _, lineIface := range function.Lines {
-			line, ok := lineIface.(*loong64Line)
-			if !ok {
-				continue
-			}
-
+		for _, line := range assembly[function.Name] {
 			// Skip pcaddu12i instructions that reference constant pools (they're no longer needed)
 			if matches := loong64PcadduConstPool.FindStringSubmatch(line.Assembly); matches != nil {
 				constLabel := "CPI" + matches[2]
@@ -552,6 +544,10 @@ func (p *Loong64Parser) generateGoAssembly(t *TranslateUnit, functions []Functio
 						builder.WriteString(fmt.Sprintf("\tMOVD F0, result+%d(FP)\n", offset))
 					case "float":
 						builder.WriteString(fmt.Sprintf("\tMOVF F0, result+%d(FP)\n", offset))
+					case "float16_t":
+						// Store 16-bit float from FP register via GP register
+						builder.WriteString("\tMOVF F0, R12\n")
+						builder.WriteString(fmt.Sprintf("\tMOVH R12, result+%d(FP)\n", offset))
 					default:
 						return fmt.Errorf("unsupported return type: %v", function.Type)
 					}

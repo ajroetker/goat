@@ -74,6 +74,12 @@ var (
 	forbidMOVI = regexp.MustCompile(`movi\s+d(\d+),\s*#0`)
 	// Scalar float loads from memory
 	scalarFloatLoad = regexp.MustCompile(`ldr\s+s\d+,`)
+
+	// Branch detection patterns for streaming mode injection
+	// Matches various branch instructions: B, B.CC, Bcc, CBZ/CBNZ, TBZ/TBNZ
+	sveBranchDetect = regexp.MustCompile(`(?i)^(?:b(?:\.[a-z]+|[a-z]{2})?\s|cbn?z|tbn?z)`)
+	// Matches branch instructions and captures the target label
+	sveBranchTarget = regexp.MustCompile(`(?i)^(?:B(?:\.[A-Z]+|[A-Z]{2})?|CBN?Z|TBN?Z)\s+.*?(\w+)\s*$`)
 )
 
 // SVE scalable vector types - size is runtime-determined (-1)
@@ -317,11 +323,9 @@ func injectStreamingMode(lines []*arm64Line) []*arm64Line {
 	// Check for branches before firstSVE - indicates complex control flow
 	// In this case, we can't safely inject streaming mode automatically
 	hasBranchBeforeSVE := false
-	// Pattern matches various branch instructions: B, B.CC, Bcc, CBZ/CBNZ, TBZ/TBNZ
-	branchDetectPattern := regexp.MustCompile(`(?i)^(?:b(?:\.[a-z]+|[a-z]{2})?\s|cbn?z|tbn?z)`)
 	for i := 0; i < firstSVE; i++ {
 		if lines[i].Assembly != "" {
-			if branchDetectPattern.MatchString(lines[i].Assembly) {
+			if sveBranchDetect.MatchString(lines[i].Assembly) {
 				hasBranchBeforeSVE = true
 				break
 			}
@@ -431,16 +435,8 @@ func injectStreamingModeConservative(lines []*arm64Line, firstSVE int) []*arm64L
 	// Find branch targets from BEFORE firstSVE
 	// These are the blocks that can bypass the main streaming entry
 	branchTargetsBeforeFirstSVE := make(map[int]bool)
-	// Match various ARM64 branch instructions:
-	// - B label (unconditional)
-	// - B.CC label (conditional with dot: B.EQ, B.NE, etc.)
-	// - Bcc label (conditional without dot: BEQ, BNE, BLE, BLT, etc.)
-	// - CBZ/CBNZ reg, label
-	// - TBZ/TBNZ reg, #bit, label
-	branchPattern := regexp.MustCompile(`(?i)^(?:B(?:\.[A-Z]+|[A-Z]{2})?|CBN?Z|TBN?Z)\s+.*?(\w+)\s*$`)
-
 	for i := range firstSVE {
-		if matches := branchPattern.FindStringSubmatch(lines[i].Assembly); len(matches) > 1 {
+		if matches := sveBranchTarget.FindStringSubmatch(lines[i].Assembly); len(matches) > 1 {
 			targetLabel := matches[1]
 			// Handle L prefix: clang generates LBB1_8 but GOAT stores BB1_8
 			lookupLabel := strings.TrimPrefix(targetLabel, "L")

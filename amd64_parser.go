@@ -251,21 +251,15 @@ func (p *AMD64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) 
 		return err
 	}
 
-	// Copy lines to functions
+	// Copy stack sizes to functions
 	for i, fn := range functions {
-		if lines, ok := assembly[fn.Name]; ok {
-			functions[i].Lines = make([]any, len(lines))
-			for j, line := range lines {
-				functions[i].Lines[j] = line
-			}
-		}
 		if sz, ok := stackSizes[fn.Name]; ok {
 			functions[i].StackSize = sz
 		}
 	}
 
 	// Generate Go assembly with constant pools
-	return p.generateGoAssembly(t, functions, constPools)
+	return p.generateGoAssembly(t, functions, assembly, constPools)
 }
 
 func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]*amd64Line, map[string]int, map[string]*amd64ConstPool, error) {
@@ -643,7 +637,7 @@ func (p *AMD64Parser) parseObjectDump(dump string, functions map[string][]*amd64
 	return nil
 }
 
-func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function, constPools map[string]*amd64ConstPool) error {
+func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function, assembly map[string][]*amd64Line, constPools map[string]*amd64ConstPool) error {
 	var builder strings.Builder
 	builder.WriteString(p.BuildTags())
 	t.writeHeader(&builder)
@@ -708,32 +702,32 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 					case X86SIMDTypeSize(param.Type) == 64:
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_0+%d(FP), AX\n", param.Name, offset))
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_8+%d(FP), BX\n", param.Name, offset+8))
-						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ AX, X14\n"))
-						argsBuilder.WriteString(fmt.Sprintf("\tPINSRQ $1, BX, X14\n"))
+						argsBuilder.WriteString("\tMOVQ AX, X14\n")
+						argsBuilder.WriteString("\tPINSRQ $1, BX, X14\n")
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_16+%d(FP), AX\n", param.Name, offset+16))
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_24+%d(FP), BX\n", param.Name, offset+24))
-						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ AX, X15\n"))
-						argsBuilder.WriteString(fmt.Sprintf("\tPINSRQ $1, BX, X15\n"))
-						argsBuilder.WriteString(fmt.Sprintf("\tVINSERTF128 $1, X15, Y14, Y14\n"))
+						argsBuilder.WriteString("\tMOVQ AX, X15\n")
+						argsBuilder.WriteString("\tPINSRQ $1, BX, X15\n")
+						argsBuilder.WriteString("\tVINSERTF128 $1, X15, Y14, Y14\n")
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_32+%d(FP), AX\n", param.Name, offset+32))
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_40+%d(FP), BX\n", param.Name, offset+40))
-						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ AX, X15\n"))
-						argsBuilder.WriteString(fmt.Sprintf("\tPINSRQ $1, BX, X15\n"))
+						argsBuilder.WriteString("\tMOVQ AX, X15\n")
+						argsBuilder.WriteString("\tPINSRQ $1, BX, X15\n")
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_48+%d(FP), AX\n", param.Name, offset+48))
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_56+%d(FP), BX\n", param.Name, offset+56))
-						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ AX, X13\n"))
-						argsBuilder.WriteString(fmt.Sprintf("\tPINSRQ $1, BX, X13\n"))
-						argsBuilder.WriteString(fmt.Sprintf("\tVINSERTF128 $1, X13, Y15, Y15\n"))
+						argsBuilder.WriteString("\tMOVQ AX, X13\n")
+						argsBuilder.WriteString("\tPINSRQ $1, BX, X13\n")
+						argsBuilder.WriteString("\tVINSERTF128 $1, X13, Y15, Y15\n")
 						argsBuilder.WriteString(fmt.Sprintf("\tVINSERTF64X4 $1, Y15, Z14, %s\n", amd64ZMMRegisters[xmmRegisterIndex]))
 					case X86SIMDTypeSize(param.Type) == 32:
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_0+%d(FP), AX\n", param.Name, offset))
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_8+%d(FP), BX\n", param.Name, offset+8))
-						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ AX, X14\n"))
-						argsBuilder.WriteString(fmt.Sprintf("\tPINSRQ $1, BX, X14\n"))
+						argsBuilder.WriteString("\tMOVQ AX, X14\n")
+						argsBuilder.WriteString("\tPINSRQ $1, BX, X14\n")
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_16+%d(FP), AX\n", param.Name, offset+16))
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_24+%d(FP), BX\n", param.Name, offset+24))
-						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ AX, X15\n"))
-						argsBuilder.WriteString(fmt.Sprintf("\tPINSRQ $1, BX, X15\n"))
+						argsBuilder.WriteString("\tMOVQ AX, X15\n")
+						argsBuilder.WriteString("\tPINSRQ $1, BX, X15\n")
 						argsBuilder.WriteString(fmt.Sprintf("\tVINSERTF128 $1, X15, Y14, %s\n", amd64YMMRegisters[xmmRegisterIndex]))
 					default:
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVQ %s_0+%d(FP), AX\n", param.Name, offset))
@@ -745,10 +739,14 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 				} else {
 					stack = append(stack, lo.Tuple2[int, Parameter]{A: offset, B: param})
 				}
-			} else if !param.Pointer && (param.Type == "double" || param.Type == "float") {
+			} else if !param.Pointer && (param.Type == "double" || param.Type == "float" || param.Type == "float16_t") {
 				if xmmRegisterIndex < len(amd64XMMRegisters) {
 					if param.Type == "double" {
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVSD %s+%d(FP), %s\n", param.Name, offset, amd64XMMRegisters[xmmRegisterIndex]))
+					} else if param.Type == "float16_t" {
+						// Load 16-bit value via MOVWLZX, then MOVL into XMM register
+						argsBuilder.WriteString(fmt.Sprintf("\tMOVWLZX %s+%d(FP), AX\n", param.Name, offset))
+						argsBuilder.WriteString(fmt.Sprintf("\tMOVL AX, %s\n", amd64XMMRegisters[xmmRegisterIndex]))
 					} else {
 						argsBuilder.WriteString(fmt.Sprintf("\tMOVSS %s+%d(FP), %s\n", param.Name, offset, amd64XMMRegisters[xmmRegisterIndex]))
 					}
@@ -843,13 +841,7 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 			}
 		}
 
-		// Convert interface{} lines back to amd64Line
-		for _, lineIface := range function.Lines {
-			line, ok := lineIface.(*amd64Line)
-			if !ok {
-				continue
-			}
-
+		for _, line := range assembly[function.Name] {
 			// Emit labels even for skipped instructions, so jump targets remain valid
 			for _, label := range line.Labels {
 				builder.WriteString(label)
@@ -891,6 +883,10 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 						builder.WriteString(fmt.Sprintf("\tMOVSD X0, result+%d(FP)\n", offset))
 					case "float":
 						builder.WriteString(fmt.Sprintf("\tMOVSS X0, result+%d(FP)\n", offset))
+					case "float16_t":
+						// Store 16-bit float from XMM register via GP register
+						builder.WriteString("\tMOVL X0, AX\n")
+						builder.WriteString(fmt.Sprintf("\tMOVW AX, result+%d(FP)\n", offset))
 					default:
 						if IsX86SIMDType(function.Type) {
 							resultOffset := offset
