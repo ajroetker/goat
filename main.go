@@ -492,7 +492,11 @@ func (t *TranslateUnit) compile(args ...string) error {
 	// Add architecture-specific compiler flags
 	args = append(args, t.parser.CompilerFlags()...)
 
-	// Cross-compilation sysroot: explicit --sysroot flag > auto-detect
+	// Include path strategy: explicit --sysroot flag > auto-detect sysroot > -nostdlibinc.
+	// GOAT generates Go assembly that never links against libc, so system headers
+	// (glibc/musl) are never needed. When no sysroot is available, -nostdlibinc
+	// suppresses system include dirs while keeping clang's built-in headers
+	// (arm_neon.h, immintrin.h, stdint.h, etc.) from the resource directory.
 	if !argsContainSysroot(args) {
 		sysroot := t.Sysroot
 		if sysroot == "" && (t.Target != runtime.GOARCH || t.TargetOS != runtime.GOOS) {
@@ -500,6 +504,8 @@ func (t *TranslateUnit) compile(args ...string) error {
 		}
 		if sysroot != "" {
 			args = append(args, "--sysroot="+sysroot)
+		} else {
+			args = append(args, "-nostdlibinc")
 		}
 	}
 
