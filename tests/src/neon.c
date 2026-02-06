@@ -1,7 +1,11 @@
 // NEON vector type tests for GOAT
 // These test passing NEON vectors by value (register-resident operations)
 
+// GOAT's C parser uses GOAT_PARSER=1 with stub type definitions from prologue.
+// During compilation, clang includes the real intrinsics header.
+#ifndef GOAT_PARSER
 #include <arm_neon.h>
+#endif
 
 // Add two float32x4 vectors
 float32x4_t add_f32x4(float32x4_t a, float32x4_t b) {
