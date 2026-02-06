@@ -730,7 +730,7 @@ func (t *TranslateUnit) convertFunctionParameters(params *cc.ParameterList) ([]P
 			position.Filename, position.Line+t.Offset, position.Column, paramType)
 	}
 	paramNames := []Parameter{{
-		Name: paramName,
+		Name: sanitizeAsmParamName(paramName),
 		ParameterType: ParameterType{
 			Type:    paramType,
 			Pointer: isPointer,
@@ -744,6 +744,29 @@ func (t *TranslateUnit) convertFunctionParameters(params *cc.ParameterList) ([]P
 		}
 	}
 	return paramNames, nil
+}
+
+// reservedAsmParamNames are names that conflict with Go's plan9 assembler
+// pseudo-registers. In ARM64 (and other arches), "g" refers to the goroutine
+// pointer, so a parameter named "g" in "g+8(FP)" is misinterpreted as
+// register+offset addressing rather than a symbolic frame reference.
+var reservedAsmParamNames = map[string]string{
+	"g":  "gv",  // goroutine register on ARM64
+	"FP": "fp_", // frame pointer pseudo-register
+	"SP": "sp_", // stack pointer pseudo-register
+	"SB": "sb_", // static base pseudo-register
+	"PC": "pc_", // program counter pseudo-register
+}
+
+// sanitizeAsmParamName renames C parameter names that conflict with Go plan9
+// assembler reserved names. For example, a C function parameter named "g"
+// would generate "g+8(FP)" in assembly, which the Go assembler interprets
+// as goroutine_register+8(frame_pointer) instead of param_g at offset 8.
+func sanitizeAsmParamName(name string) string {
+	if replacement, ok := reservedAsmParamNames[name]; ok {
+		return replacement
+	}
+	return name
 }
 
 func (t *TranslateUnit) writeHeader(builder *strings.Builder) {
