@@ -150,21 +150,15 @@ func (p *RISCV64Parser) TranslateAssembly(t *TranslateUnit, functions []Function
 		return err
 	}
 
-	// Copy lines to functions
+	// Copy stack sizes to functions
 	for i, fn := range functions {
-		if lines, ok := assembly[fn.Name]; ok {
-			functions[i].Lines = make([]any, len(lines))
-			for j, line := range lines {
-				functions[i].Lines[j] = line
-			}
-		}
 		if sz, ok := stackSizes[fn.Name]; ok {
 			functions[i].StackSize = sz
 		}
 	}
 
 	// Generate Go assembly with constant pools
-	return p.generateGoAssembly(t, functions, constPools)
+	return p.generateGoAssembly(t, functions, assembly, constPools)
 }
 
 func (p *RISCV64Parser) parseAssembly(path string) (map[string][]*riscv64Line, map[string]int, map[string]*riscv64ConstPool, error) {
@@ -414,7 +408,7 @@ func (p *RISCV64Parser) parseObjectDump(dump string, functions map[string][]*ris
 	return nil
 }
 
-func (p *RISCV64Parser) generateGoAssembly(t *TranslateUnit, functions []Function, constPools map[string]*riscv64ConstPool) error {
+func (p *RISCV64Parser) generateGoAssembly(t *TranslateUnit, functions []Function, assembly map[string][]*riscv64Line, constPools map[string]*riscv64ConstPool) error {
 	// generate code
 	var builder strings.Builder
 	builder.WriteString(p.BuildTags())
@@ -459,10 +453,14 @@ func (p *RISCV64Parser) generateGoAssembly(t *TranslateUnit, functions []Functio
 			if offset%sz != 0 {
 				offset += sz - offset%sz
 			}
-			if !param.Pointer && (param.Type == "double" || param.Type == "float") {
+			if !param.Pointer && (param.Type == "double" || param.Type == "float" || param.Type == "float16_t") {
 				if fpRegisterCount < len(riscv64FPRegisters) {
 					if param.Type == "double" {
 						builder.WriteString(fmt.Sprintf("\tMOVD %s+%d(FP), %s\n", param.Name, offset, riscv64FPRegisters[fpRegisterCount]))
+					} else if param.Type == "float16_t" {
+						// Load 16-bit to GP register, then move to FP register
+						builder.WriteString(fmt.Sprintf("\tMOVH %s+%d(FP), X5\n", param.Name, offset))
+						builder.WriteString(fmt.Sprintf("\tMOVW X5, %s\n", riscv64FPRegisters[fpRegisterCount]))
 					} else {
 						builder.WriteString(fmt.Sprintf("\tMOVF %s+%d(FP), %s\n", param.Name, offset, riscv64FPRegisters[fpRegisterCount]))
 					}
@@ -513,11 +511,7 @@ func (p *RISCV64Parser) generateGoAssembly(t *TranslateUnit, functions []Functio
 		// and track which register they use
 		constPoolRegs := make(map[string]string) // baseReg -> constLabel
 
-		for _, lineIface := range function.Lines {
-			line, ok := lineIface.(*riscv64Line)
-			if !ok {
-				continue
-			}
+		for _, line := range assembly[function.Name] {
 			if matches := riscv64AuipcConstPool.FindStringSubmatch(line.Assembly); matches != nil {
 				baseReg := strings.ToLower(matches[1])
 				constLabel := "CPI" + matches[2]
@@ -527,13 +521,7 @@ func (p *RISCV64Parser) generateGoAssembly(t *TranslateUnit, functions []Functio
 			}
 		}
 
-		// Convert interface{} lines back to riscv64Line
-		for _, lineIface := range function.Lines {
-			line, ok := lineIface.(*riscv64Line)
-			if !ok {
-				continue
-			}
-
+		for _, line := range assembly[function.Name] {
 			// Skip auipc instructions that reference constant pools (they're no longer needed)
 			if matches := riscv64AuipcConstPool.FindStringSubmatch(line.Assembly); matches != nil {
 				constLabel := "CPI" + matches[2]
@@ -603,6 +591,10 @@ func (p *RISCV64Parser) generateGoAssembly(t *TranslateUnit, functions []Functio
 						builder.WriteString(fmt.Sprintf("\tMOVD FA0, result+%d(FP)\n", offset))
 					case "float":
 						builder.WriteString(fmt.Sprintf("\tMOVF FA0, result+%d(FP)\n", offset))
+					case "float16_t":
+						// Store 16-bit float from FP register via GP register
+						builder.WriteString("\tMOVW FA0, X5\n")
+						builder.WriteString(fmt.Sprintf("\tMOVH X5, result+%d(FP)\n", offset))
 					default:
 						return fmt.Errorf("unsupported return type: %v", function.Type)
 					}
