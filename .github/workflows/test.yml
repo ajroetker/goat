@@ -98,6 +98,7 @@ jobs:
       - name: Cross-compile arm64 NEON on x86_64 (no target sysroot)
         run: |
           mkdir -p /tmp/cross-out
+          cd /tmp/cross-out && go mod init cross-out
           ln -sf /usr/bin/aarch64-linux-gnu-objdump /tmp/cross-bin/arm64/objdump
           PATH="/tmp/cross-bin/arm64:$PATH" goat tests/src/neon.c -o /tmp/cross-out -t arm64 --target-os linux
           cd /tmp/cross-out && GOARCH=arm64 GOOS=linux go build .
