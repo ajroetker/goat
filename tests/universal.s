@@ -6,24 +6,21 @@
 // flags: -O0
 // source: tests/src/universal.c
 
-TEXT ·add(SB), $0-24
+TEXT ·add(SB), $16-24
 	MOVD a+0(FP), R0
 	MOVD b+8(FP), R1
-	WORD $0xd10043ff       // sub	sp, sp, #16
 	WORD $0xf90007e0       // str	x0, [sp, #8]
 	WORD $0xf90003e1       // str	x1, [sp]
 	WORD $0xf94007e8       // ldr	x8, [sp, #8]
 	WORD $0xf94003e9       // ldr	x9, [sp]
 	WORD $0x8b090100       // add	x0, x8, x9
-	WORD $0x910043ff       // add	sp, sp, #16
 	MOVD R0, result+16(FP)
 	RET
 
-TEXT ·l2(SB), $0-28
+TEXT ·l2(SB), $48-28
 	MOVD a+0(FP), R0
 	MOVD b+8(FP), R1
 	MOVD n+16(FP), R2
-	WORD $0xd100c3ff  // sub	sp, sp, #48
 	WORD $0xf90017e0  // str	x0, [sp, #40]
 	WORD $0xf90013e1  // str	x1, [sp, #32]
 	WORD $0xf9000fe2  // str	x2, [sp, #24]
@@ -66,18 +63,16 @@ BB1_3:
 
 BB1_4:
 	WORD  $0xbd4017e0       // ldr	s0, [sp, #20]
-	WORD  $0x9100c3ff       // add	sp, sp, #48
 	FMOVS F0, result+24(FP)
 	RET
 
-TEXT ·mat_mul(SB), $0-48
+TEXT ·mat_mul(SB), $64-48
 	MOVD a+0(FP), R0
 	MOVD b+8(FP), R1
 	MOVD res+16(FP), R2
 	MOVD d1+24(FP), R3
 	MOVD d2+32(FP), R4
 	MOVD d3+40(FP), R5
-	WORD $0xd10103ff    // sub	sp, sp, #64
 	WORD $0xf9001fe0    // str	x0, [sp, #56]
 	WORD $0xf9001be1    // str	x1, [sp, #48]
 	WORD $0xf90017e2    // str	x2, [sp, #40]
@@ -171,12 +166,10 @@ BB2_11:
 	B    BB2_1
 
 BB2_12:
-	WORD $0x910103ff // add	sp, sp, #64
 	RET
 
-TEXT ·mul2(SB), $0-12
+TEXT ·mul2(SB), $16-12
 	FMOVS a+0(FP), F0
-	WORD  $0xd10043ff      // sub	sp, sp, #16
 	WORD  $0xbd0007e0      // str	s0, [sp, #4]
 	WORD  $0xbd4007e1      // ldr	s1, [sp, #4]
 	WORD  $0xbd4007e0      // ldr	s0, [sp, #4]
@@ -185,22 +178,19 @@ TEXT ·mul2(SB), $0-12
 	WORD  $0xbd400fe0      // ldr	s0, [sp, #12]
 	WORD  $0xbd400be1      // ldr	s1, [sp, #8]
 	WORD  $0x1e212800      // fadd	s0, s0, s1
-	WORD  $0x910043ff      // add	sp, sp, #16
 	FMOVS F0, result+8(FP)
 	RET
 
-TEXT ·_not(SB), $0-9
-	MOVD a+0(FP), R0
-	WORD $0xd10043ff      // sub	sp, sp, #16
-	WORD $0x39003fe0      // strb	w0, [sp, #15]
-	WORD $0x39403fe8      // ldrb	w8, [sp, #15]
-	WORD $0x52000108      // eor	w8, w8, #0x1
-	WORD $0x12000100      // and	w0, w8, #0x1
-	WORD $0x910043ff      // add	sp, sp, #16
-	MOVD R0, result+8(FP)
+TEXT ·_not(SB), $16-9
+	MOVBU a+0(FP), R0
+	WORD  $0x39003fe0      // strb	w0, [sp, #15]
+	WORD  $0x39403fe8      // ldrb	w8, [sp, #15]
+	WORD  $0x52000108      // eor	w8, w8, #0x1
+	WORD  $0x12000100      // and	w0, w8, #0x1
+	MOVD  R0, result+8(FP)
 	RET
 
-TEXT ·sum(SB), $16-88
+TEXT ·sum(SB), $96-88
 	MOVD x1+0(FP), R0
 	MOVD x2+8(FP), R1
 	MOVD x3+16(FP), R2
@@ -210,10 +200,9 @@ TEXT ·sum(SB), $16-88
 	MOVD x7+48(FP), R6
 	MOVD x8+56(FP), R7
 	MOVD x9+64(FP), R8
-	MOVD R8, 0(RSP)
+	MOVD R8, 80(RSP)
 	MOVD x10+72(FP), R8
-	MOVD R8, 8(RSP)
-	WORD $0xd10143ff       // sub	sp, sp, #80
+	MOVD R8, 88(RSP)
 	WORD $0xf9402be9       // ldr	x9, [sp, #80]
 	WORD $0xf9402fe8       // ldr	x8, [sp, #88]
 	WORD $0xf90027e0       // str	x0, [sp, #72]
@@ -245,11 +234,10 @@ TEXT ·sum(SB), $16-88
 	WORD $0x8b090108       // add	x8, x8, x9
 	WORD $0xf94003e9       // ldr	x9, [sp]
 	WORD $0x8b090100       // add	x0, x8, x9
-	WORD $0x910143ff       // add	sp, sp, #80
 	MOVD R0, result+80(FP)
 	RET
 
-TEXT ·mul(SB), $0-64
+TEXT ·mul(SB), $64-64
 	FMOVS v1+0(FP), F0
 	FMOVD v2+8(FP), F1
 	FMOVS v3+16(FP), F2
@@ -258,7 +246,6 @@ TEXT ·mul(SB), $0-64
 	FMOVD v6+32(FP), F5
 	MOVD  v7+40(FP), R0
 	FMOVD v8+48(FP), F6
-	WORD  $0xd10103ff       // sub	sp, sp, #64
 	WORD  $0xbd003fe0       // str	s0, [sp, #60]
 	WORD  $0xfd001be1       // str	d1, [sp, #48]
 	WORD  $0xbd002fe2       // str	s2, [sp, #44]
@@ -286,11 +273,10 @@ TEXT ·mul(SB), $0-64
 	WORD  $0x1e610800       // fmul	d0, d0, d1
 	WORD  $0xfd4007e1       // ldr	d1, [sp, #8]
 	WORD  $0x1e610800       // fmul	d0, d0, d1
-	WORD  $0x910103ff       // add	sp, sp, #64
 	FMOVD F0, result+56(FP)
 	RET
 
-TEXT ·reverse(SB), $16-80
+TEXT ·reverse(SB), $112-80
 	MOVD x1+0(FP), R0
 	MOVD x2+8(FP), R1
 	MOVD x3+16(FP), R2
@@ -300,10 +286,9 @@ TEXT ·reverse(SB), $16-80
 	MOVD x7+48(FP), R6
 	MOVD x8+56(FP), R7
 	MOVD x9+64(FP), R8
-	MOVD R8, 0(RSP)
+	MOVD R8, 96(RSP)
 	MOVD x10+72(FP), R8
-	MOVD R8, 8(RSP)
-	WORD $0xd10183ff    // sub	sp, sp, #96
+	MOVD R8, 104(RSP)
 	WORD $0xf94033e9    // ldr	x9, [sp, #96]
 	WORD $0xf94037e8    // ldr	x8, [sp, #104]
 	WORD $0xf9002fe0    // str	x0, [sp, #88]
@@ -366,5 +351,4 @@ TEXT ·reverse(SB), $16-80
 	WORD $0xbd400fe0    // ldr	s0, [sp, #12]
 	WORD $0xf9401be8    // ldr	x8, [sp, #48]
 	WORD $0xbd000100    // str	s0, [x8]
-	WORD $0x910183ff    // add	sp, sp, #96
 	RET

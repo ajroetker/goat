@@ -972,6 +972,10 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 		// alignment for return values. The 16-byte alignment is only needed for the
 		// stack frame (stackOffset), not for the FP-relative parameter offsets.
 
+		// Overflow args must be placed above the C function's local variables.
+		// The C compiler emits code that reads overflow args at [sp + localFrameSize],
+		// so we store them at RSP + function.StackSize.
+		spillBase := function.StackSize
 		stackOffset := 0
 		if len(stack) > 0 {
 			for i := 0; i < len(stack); i++ {
@@ -987,22 +991,22 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 						if is64bit {
 							// 64-bit vector: single 8-byte copy
 							argsBuilder.WriteString(fmt.Sprintf("\tMOVD %s+%d(FP), R8\n", stack[i].B.Name, srcOffset))
-							argsBuilder.WriteString(fmt.Sprintf("\tMOVD R8, %d(RSP)\n", stackOffset))
+							argsBuilder.WriteString(fmt.Sprintf("\tMOVD R8, %d(RSP)\n", spillBase+stackOffset))
 							stackOffset += 8
 						} else {
 							// 128-bit vector: two 8-byte copies
 							// Use _N suffixes (N=offset within param) so go vet accepts different offsets
 							localOffset := v * 16 // offset within this parameter's storage
 							argsBuilder.WriteString(fmt.Sprintf("\tMOVD %s_%d+%d(FP), R8\n", stack[i].B.Name, localOffset, srcOffset))
-							argsBuilder.WriteString(fmt.Sprintf("\tMOVD R8, %d(RSP)\n", stackOffset))
+							argsBuilder.WriteString(fmt.Sprintf("\tMOVD R8, %d(RSP)\n", spillBase+stackOffset))
 							argsBuilder.WriteString(fmt.Sprintf("\tMOVD %s_%d+%d(FP), R8\n", stack[i].B.Name, localOffset+8, srcOffset+8))
-							argsBuilder.WriteString(fmt.Sprintf("\tMOVD R8, %d(RSP)\n", stackOffset+8))
+							argsBuilder.WriteString(fmt.Sprintf("\tMOVD R8, %d(RSP)\n", spillBase+stackOffset+8))
 							stackOffset += 16
 						}
 					}
 				} else {
 					argsBuilder.WriteString(fmt.Sprintf("\tMOVD %s+%d(FP), R8\n", stack[i].B.Name, stack[i].A))
-					argsBuilder.WriteString(fmt.Sprintf("\tMOVD R8, %d(RSP)\n", stackOffset))
+					argsBuilder.WriteString(fmt.Sprintf("\tMOVD R8, %d(RSP)\n", spillBase+stackOffset))
 					if stack[i].B.Pointer {
 						stackOffset += 8
 					} else {
@@ -1022,9 +1026,8 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 			offset += 8 - offset%8
 		}
 
-		// Use the larger of: calculated stack offset (for parameter spill) or
-		// detected stack size (from 'sub sp, sp, #N' in the compiled assembly)
-		frameSize := max(function.StackSize, stackOffset)
+		// The frame must hold both the C function's local variables and the overflow args.
+		frameSize := function.StackSize + stackOffset
 		// Ensure 16-byte alignment for the frame (required by Go assembler on ARM64)
 		if frameSize > 0 && frameSize%16 != 0 {
 			frameSize += 16 - frameSize%16

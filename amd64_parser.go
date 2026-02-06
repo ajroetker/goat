@@ -797,6 +797,10 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 			hasSIMD = true
 		}
 
+		// Overflow args must be placed above the C function's local variables.
+		// The C compiler emits code that reads overflow args at [rsp + localFrameSize],
+		// so we store them at SP + function.StackSize.
+		spillBase := function.StackSize
 		stackOffset := 0
 		if len(stack) > 0 {
 			for i := 0; i < len(stack); i++ {
@@ -813,11 +817,9 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 			stackOffset += 16 - stackOffset%16
 		}
 
-		// Use the larger of: calculated stack offset (for parameter spill) or
-		// detected stack size (from 'subq $N, %rsp' in the compiled assembly).
-		// Go allocates this frame, so we remove the C-generated subq/addq instructions.
-		frameSize := max(function.StackSize, stackOffset)
-		// Ensure 16-byte alignment for the frame if we're using C-detected stack size
+		// The frame must hold both the C function's local variables and the overflow args.
+		frameSize := function.StackSize + stackOffset
+		// Ensure 16-byte alignment for the frame
 		if frameSize > 0 && frameSize%16 != 0 {
 			frameSize += 16 - frameSize%16
 		}
@@ -827,10 +829,18 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 		builder.WriteString(argsBuilder.String())
 
 		if len(stack) > 0 {
-			for i := len(stack) - 1; i >= 0; i-- {
-				builder.WriteString(fmt.Sprintf("\tPUSHQ %s+%d(FP)\n", stack[i].B.Name, stack[i].A))
+			spillOffset := 0
+			for i := 0; i < len(stack); i++ {
+				builder.WriteString(fmt.Sprintf("\tMOVQ %s+%d(FP), R11\n", stack[i].B.Name, stack[i].A))
+				builder.WriteString(fmt.Sprintf("\tMOVQ R11, %d(SP)\n", spillBase+spillOffset))
+				if simdSz := X86SIMDTypeSize(stack[i].B.Type); simdSz > 0 {
+					spillOffset += simdSz
+				} else if stack[i].B.Pointer {
+					spillOffset += 8
+				} else {
+					spillOffset += supportedTypes[stack[i].B.Type]
+				}
 			}
-			builder.WriteString("\tPUSHQ $0\n")
 		}
 
 		// Convert interface{} lines back to amd64Line
