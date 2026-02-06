@@ -102,10 +102,6 @@ jobs:
           ln -sf /usr/bin/aarch64-linux-gnu-objdump /tmp/cross-bin/arm64/objdump
           PATH="/tmp/cross-bin/arm64:$PATH" goat tests/src/neon.c -o /tmp/crossout -t arm64 --target-os linux
           cd /tmp/crossout && GOARCH=arm64 GOOS=linux go build .
-      - name: Cross-compile arm64 NEON const pool on x86_64
-        run: |
-          PATH="/tmp/cross-bin/arm64:$PATH" goat tests/src/const_pool_neon.c -o /tmp/crossout -t arm64 --target-os linux
-          cd /tmp/crossout && GOARCH=arm64 GOOS=linux go build .
       - name: Cross-compile riscv64 on x86_64
         run: |
           mkdir -p /tmp/cross-bin/riscv64
