@@ -455,16 +455,21 @@ func injectStreamingModeConservative(lines []*arm64Line, firstSVE int) []*arm64L
 	// Always inject before firstSVE
 	smstartPositions[firstSVE] = true
 
-	// For each branch target that bypasses firstSVE, find first SVE in that block
+	// For each branch target that bypasses firstSVE, find first SVE in that block.
+	// We scan forward through fallthrough blocks (labels don't stop execution flow)
+	// until we find an SVE instruction, a ret, or an unconditional branch.
 	for targetLine := range branchTargetsBeforeFirstSVE {
-		// Find first SVE instruction in this block
 		for j := targetLine; j < len(lines); j++ {
-			// Stop at next label or ret
-			if j > targetLine && (len(lines[j].Labels) > 0 || lines[j].Assembly == "ret") {
-				break
-			}
 			if isSVEInstruction(lines[j].Assembly) {
 				smstartPositions[j] = true
+				break
+			}
+			// Stop at ret or unconditional branch (no fallthrough possible)
+			asm := lines[j].Assembly
+			if asm == "ret" {
+				break
+			}
+			if strings.HasPrefix(asm, "b\t") || strings.HasPrefix(asm, "b ") || asm == "b" {
 				break
 			}
 		}
