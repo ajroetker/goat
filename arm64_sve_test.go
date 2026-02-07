@@ -489,6 +489,154 @@ func TestIsSVEType(t *testing.T) {
 	}
 }
 
+func TestInjectStreamingModeConservative(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    []*arm64Line
+		firstSVE int
+		wantAsm  []string
+	}{
+		{
+			name: "basic - smstart before firstSVE and smstop before ret",
+			input: []*arm64Line{
+				{Assembly: "mov\tx0, x1"},
+				{Assembly: "ld1w\t{z0.s}, p0/z, [x0]"},
+				{Assembly: "ret"},
+			},
+			firstSVE: 1,
+			wantAsm:  []string{"mov\tx0, x1", "smstart\tsm", "ld1w\t{z0.s}, p0/z, [x0]", "smstop\tsm", "ret"},
+		},
+		{
+			name: "branch bypass - smstart at bypass SVE too",
+			input: []*arm64Line{
+				// Line 0: branch that bypasses firstSVE (targets BB0_2 at line 4)
+				{Assembly: "b.eq\tLBB0_2"},
+				// Line 1: firstSVE on the non-bypass path
+				{Assembly: "ld1w\t{z0.s}, p0/z, [x0]"},
+				{Assembly: "ret"},
+				// Line 3: label target (non-SVE preamble in bypass block)
+				{Labels: []string{"BB0_2"}, Assembly: "mov\tx9, x1"},
+				// Line 4: SVE in bypass block
+				{Assembly: "st1w\t{z1.s}, p0, [x1]"},
+				{Assembly: "ret"},
+			},
+			firstSVE: 1,
+			wantAsm: []string{
+				"b.eq\tLBB0_2",
+				"smstart\tsm", "ld1w\t{z0.s}, p0/z, [x0]",
+				"smstop\tsm", "ret",
+				"mov\tx9, x1",
+				"smstart\tsm", "st1w\t{z1.s}, p0, [x1]",
+				"smstop\tsm", "ret",
+			},
+		},
+		{
+			name: "fallthrough past label finds SVE instruction",
+			input: []*arm64Line{
+				// Line 0: branch targeting BB0_2
+				{Assembly: "b.ne\tLBB0_2"},
+				// Line 1: firstSVE
+				{Assembly: "fadd\tz0.s, z1.s, z2.s"},
+				{Assembly: "ret"},
+				// Line 3: branch target label, no SVE here
+				{Labels: []string{"BB0_2"}, Assembly: "mov\tx0, #0"},
+				// Line 4: another label (fallthrough), still no SVE
+				{Labels: []string{"BB0_3"}, Assembly: "add\tx1, x1, #1"},
+				// Line 5: SVE reached via fallthrough
+				{Assembly: "ld1w\t{z0.s}, p0/z, [x0]"},
+				{Assembly: "ret"},
+			},
+			firstSVE: 1,
+			wantAsm: []string{
+				"b.ne\tLBB0_2",
+				"smstart\tsm", "fadd\tz0.s, z1.s, z2.s",
+				"smstop\tsm", "ret",
+				"mov\tx0, #0",
+				"add\tx1, x1, #1",
+				"smstart\tsm", "ld1w\t{z0.s}, p0/z, [x0]",
+				"smstop\tsm", "ret",
+			},
+		},
+		{
+			name: "unconditional branch stops scan",
+			input: []*arm64Line{
+				{Assembly: "b.eq\tLBB0_2"},
+				// firstSVE
+				{Assembly: "ld1w\t{z0.s}, p0/z, [x0]"},
+				{Assembly: "ret"},
+				// Branch target: non-SVE then unconditional branch
+				{Labels: []string{"BB0_2"}, Assembly: "mov\tx0, #0"},
+				{Assembly: "b\tLBB0_3"},
+				// SVE after unconditional branch - should NOT get smstart
+				{Labels: []string{"BB0_3"}, Assembly: "fadd\tz0.s, z1.s, z2.s"},
+				{Assembly: "ret"},
+			},
+			firstSVE: 1,
+			wantAsm: []string{
+				"b.eq\tLBB0_2",
+				"smstart\tsm", "ld1w\t{z0.s}, p0/z, [x0]",
+				"smstop\tsm", "ret",
+				"mov\tx0, #0",
+				"b\tLBB0_3",
+				// No smstart here - unreachable via fallthrough from bypass
+				"fadd\tz0.s, z1.s, z2.s",
+				"smstop\tsm", "ret",
+			},
+		},
+		{
+			name: "ret stops scan without SVE",
+			input: []*arm64Line{
+				{Assembly: "cbz\tx0, LBB0_2"},
+				// firstSVE
+				{Assembly: "ld1w\t{z0.s}, p0/z, [x0]"},
+				{Assembly: "ret"},
+				// Branch target: no SVE before ret
+				{Labels: []string{"BB0_2"}, Assembly: "mov\tx0, #0"},
+				{Assembly: "ret"},
+			},
+			firstSVE: 1,
+			wantAsm: []string{
+				"cbz\tx0, LBB0_2",
+				"smstart\tsm", "ld1w\t{z0.s}, p0/z, [x0]",
+				"smstop\tsm", "ret",
+				// No smstart - bypass path has no SVE
+				"mov\tx0, #0",
+				"smstop\tsm", "ret",
+			},
+		},
+		{
+			name: "labels on ret moved to smstop in conservative mode",
+			input: []*arm64Line{
+				{Assembly: "ld1w\t{z0.s}, p0/z, [x0]"},
+				{Labels: []string{"BB0_exit"}, Assembly: "ret"},
+			},
+			firstSVE: 0,
+			wantAsm: []string{
+				"smstart\tsm", "ld1w\t{z0.s}, p0/z, [x0]",
+				"smstop\tsm", "ret",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := injectStreamingModeConservative(tt.input, tt.firstSVE)
+			gotAsm := make([]string, len(result))
+			for i, line := range result {
+				gotAsm[i] = line.Assembly
+			}
+			if len(gotAsm) != len(tt.wantAsm) {
+				t.Fatalf("got %d lines %v, want %d lines %v", len(gotAsm), gotAsm, len(tt.wantAsm), tt.wantAsm)
+			}
+			for i := range gotAsm {
+				if gotAsm[i] != tt.wantAsm[i] {
+					t.Errorf("line %d: asm = %q, want %q\ngot:  %v\nwant: %v", i, gotAsm[i], tt.wantAsm[i], gotAsm, tt.wantAsm)
+				}
+			}
+		})
+	}
+}
+
 func TestSVEPrologue(t *testing.T) {
 	prologue := SVEPrologue()
 	// Check that essential type definitions are present
