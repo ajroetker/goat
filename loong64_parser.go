@@ -46,6 +46,8 @@ var (
 	loong64WordDirective = regexp.MustCompile(`^\s+\.word\s+(0x[0-9a-fA-F]+|\d+)`)
 	// Match .dword directive with hex or decimal value (64-bit)
 	loong64DwordDirective = regexp.MustCompile(`^\s+\.dword\s+(0x[0-9a-fA-F]+|\d+)`)
+	// Match .byte directive with hex or decimal value
+	loong64ByteDirective = regexp.MustCompile(`^\s+\.byte\s+(0x[0-9a-fA-F]+|\d+)`)
 	// Match pcaddu12i instruction referencing constant pool: pcaddu12i $r4, %pc_hi20(.LCPI0_0)
 	loong64PcadduConstPool = regexp.MustCompile(`pcaddu12i\s+(\$\w+),\s*%pc_hi20\(\.LCPI(\d+_\d+)\)`)
 	// Match ld.w/ld.d instruction with constant pool reference: ld.d $r4, $r4, %pc_lo12(.LCPI0_0)
@@ -231,6 +233,8 @@ func (p *Loong64Parser) parseAssembly(path string) (map[string][]*loong64Line, m
 		// Constant pool parsing state
 		currentConstPool  *loong64ConstPool
 		currentConstLabel string
+		byteAccum         uint32 // accumulates .byte values into 32-bit words (little-endian)
+		byteCount         int    // number of bytes accumulated (0-3)
 	)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -238,9 +242,17 @@ func (p *Loong64Parser) parseAssembly(path string) (map[string][]*loong64Line, m
 
 		// Check for constant pool label (.LCPI0_0:)
 		if loong64ConstPoolLabel.MatchString(line) {
-			// Save previous constant pool if any
-			if currentConstPool != nil && len(currentConstPool.Data) > 0 {
-				constPools[currentConstLabel] = currentConstPool
+			// Flush partial byte accumulation and save previous constant pool
+			if currentConstPool != nil {
+				if byteCount > 0 {
+					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
+					currentConstPool.Size += 4
+					byteAccum = 0
+					byteCount = 0
+				}
+				if len(currentConstPool.Data) > 0 {
+					constPools[currentConstLabel] = currentConstPool
+				}
 			}
 			// Start new constant pool
 			labelPart := strings.Split(line, ":")[0]
@@ -254,9 +266,16 @@ func (p *Loong64Parser) parseAssembly(path string) (map[string][]*loong64Line, m
 			continue
 		}
 
-		// Parse .word directives for constant pool data (32-bit)
+		// Parse .word/.dword/.byte directives for constant pool data
 		if currentConstPool != nil {
 			if matches := loong64WordDirective.FindStringSubmatch(line); matches != nil {
+				// Flush any partial byte accumulation
+				if byteCount > 0 {
+					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
+					currentConstPool.Size += 4
+					byteAccum = 0
+					byteCount = 0
+				}
 				val := loong64ParseIntValue(matches[1])
 				currentConstPool.Data = append(currentConstPool.Data, uint32(val))
 				currentConstPool.Size += 4
@@ -264,19 +283,47 @@ func (p *Loong64Parser) parseAssembly(path string) (map[string][]*loong64Line, m
 			}
 			// Parse .dword directives for constant pool data (64-bit)
 			if matches := loong64DwordDirective.FindStringSubmatch(line); matches != nil {
+				// Flush any partial byte accumulation
+				if byteCount > 0 {
+					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
+					currentConstPool.Size += 4
+					byteAccum = 0
+					byteCount = 0
+				}
 				val := loong64ParseIntValue(matches[1])
 				// Store dword as two 32-bit words (little-endian)
 				currentConstPool.Data = append(currentConstPool.Data, uint32(val), uint32(val>>32))
 				currentConstPool.Size += 8
 				continue
 			}
+			if matches := loong64ByteDirective.FindStringSubmatch(line); matches != nil {
+				val := loong64ParseIntValue(matches[1])
+				// Accumulate bytes into 32-bit words (little-endian)
+				byteAccum |= uint32(val&0xFF) << (byteCount * 8)
+				byteCount++
+				if byteCount == 4 {
+					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
+					currentConstPool.Size += 4
+					byteAccum = 0
+					byteCount = 0
+				}
+				continue
+			}
 		}
 
 		// Check for section change or function start that ends constant pool parsing
 		if loong64NameLine.MatchString(line) || strings.HasPrefix(strings.TrimSpace(line), ".section") {
-			// Save current constant pool if any
-			if currentConstPool != nil && len(currentConstPool.Data) > 0 {
-				constPools[currentConstLabel] = currentConstPool
+			// Flush partial byte accumulation and save current constant pool
+			if currentConstPool != nil {
+				if byteCount > 0 {
+					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
+					currentConstPool.Size += 4
+					byteAccum = 0
+					byteCount = 0
+				}
+				if len(currentConstPool.Data) > 0 {
+					constPools[currentConstLabel] = currentConstPool
+				}
 				currentConstPool = nil
 				currentConstLabel = ""
 			}
@@ -312,8 +359,14 @@ func (p *Loong64Parser) parseAssembly(path string) (map[string][]*loong64Line, m
 	}
 
 	// Save any remaining constant pool
-	if currentConstPool != nil && len(currentConstPool.Data) > 0 {
-		constPools[currentConstLabel] = currentConstPool
+	if currentConstPool != nil {
+		if byteCount > 0 {
+			currentConstPool.Data = append(currentConstPool.Data, byteAccum)
+			currentConstPool.Size += 4
+		}
+		if len(currentConstPool.Data) > 0 {
+			constPools[currentConstLabel] = currentConstPool
+		}
 	}
 
 	if err = scanner.Err(); err != nil {

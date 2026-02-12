@@ -104,6 +104,20 @@ func (t *TranslateUnit) parseSource() ([]Function, error) {
 			}
 		}
 	}
+	// Provide standard integer type aliases from <stdint.h>.
+	// Architecture prologues block system SIMD headers (arm_neon.h, immintrin.h,
+	// etc.) via include guards, which prevents <stdint.h> from being transitively
+	// included. The C parser needs these typedefs to recognize int64_t, int32_t,
+	// etc. in function signatures and bodies.
+	prologue.WriteString("typedef signed char int8_t;\n")
+	prologue.WriteString("typedef short int16_t;\n")
+	prologue.WriteString("typedef int int32_t;\n")
+	prologue.WriteString("typedef long int64_t;\n")
+	prologue.WriteString("typedef unsigned char uint8_t;\n")
+	prologue.WriteString("typedef unsigned short uint16_t;\n")
+	prologue.WriteString("typedef unsigned int uint32_t;\n")
+	prologue.WriteString("typedef unsigned long uint64_t;\n")
+
 	// Add architecture-specific prologue from parser
 	prologue.WriteString(t.parser.Prologue())
 	ast, err := cc.Parse(cfg, []cc.Source{

@@ -64,12 +64,18 @@ var (
 	arm64LongDirective = regexp.MustCompile(`^\s+\.long\s+(0x[0-9a-fA-F]+|\d+)`)
 	// Match .quad directive with hex or decimal value (hex must come first in alternation)
 	arm64QuadDirective = regexp.MustCompile(`^\s+\.quad\s+(0x[0-9a-fA-F]+|\d+)`)
-	// Match section directive for literal data
-	arm64LiteralSection = regexp.MustCompile(`^\s+\.section\s+__TEXT,__literal`)
-	// Match adrp instruction referencing constant pool
-	arm64AdrpConstPool = regexp.MustCompile(`adrp\s+(\w+),\s*\.?[lL]?CPI(\d+_\d+)@PAGE`)
-	// Match ldr instruction with constant pool PAGEOFF reference
-	arm64LdrConstPoolPageoff = regexp.MustCompile(`ldr\s+(\w+),\s*\[(\w+),\s*\.?[lL]?CPI(\d+_\d+)@PAGEOFF\]`)
+	// Match .byte directive with hex or decimal value
+	arm64ByteDirective = regexp.MustCompile(`^\s+\.byte\s+(0x[0-9a-fA-F]+|\d+)`)
+	// Match section directive for literal data (macOS: __TEXT,__literal*, Linux: .rodata)
+	arm64LiteralSection = regexp.MustCompile(`^\s+\.section\s+(__TEXT,__literal|\.rodata)`)
+	// Match adrp instruction referencing constant pool.
+	// macOS Mach-O: adrp x0, .LCPI0_0@PAGE
+	// Linux ELF:    adrp x0, .LCPI0_0
+	arm64AdrpConstPool = regexp.MustCompile(`adrp\s+(\w+),\s*\.?[lL]?CPI(\d+_\d+)(?:@PAGE)?`)
+	// Match ldr instruction with constant pool page-offset reference.
+	// macOS Mach-O: ldr v1, [x0, .LCPI0_0@PAGEOFF]
+	// Linux ELF:    ldr v1, [x0, :lo12:.LCPI0_0]
+	arm64LdrConstPoolPageoff = regexp.MustCompile(`ldr\s+(\w+),\s*\[(\w+),\s*(?::lo12:)?\.?[lL]?CPI(\d+_\d+)(?:@PAGEOFF)?\]`)
 	// Match ldr instruction with just register (for Linux-style PC-relative)
 	arm64LdrConstPoolReg = regexp.MustCompile(`ldr\s+(\w+),\s*\[(\w+)\]`)
 )
@@ -498,6 +504,8 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 		inLiteralSection  bool
 		currentConstPool  *arm64ConstPool
 		currentConstLabel string
+		byteAccum         uint32 // accumulates .byte values into 32-bit words (little-endian)
+		byteCount         int    // number of bytes accumulated (0-3)
 	)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -511,9 +519,17 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 
 		// Check for constant pool label (lCPI0_0: or .LCPI0_0:)
 		if arm64ConstPoolLabel.MatchString(line) {
-			// Save previous constant pool if any
-			if currentConstPool != nil && len(currentConstPool.Data) > 0 {
-				constPools[currentConstLabel] = currentConstPool
+			// Flush partial byte accumulation and save previous constant pool
+			if currentConstPool != nil {
+				if byteCount > 0 {
+					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
+					currentConstPool.Size += 4
+					byteAccum = 0
+					byteCount = 0
+				}
+				if len(currentConstPool.Data) > 0 {
+					constPools[currentConstLabel] = currentConstPool
+				}
 			}
 			// Start new constant pool
 			labelPart := strings.Split(line, ":")[0]
@@ -528,10 +544,17 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 			continue
 		}
 
-		// Parse .long directives for constant pool data
+		// Parse .long/.quad/.byte directives for constant pool data
 		if inLiteralSection || currentConstPool != nil {
 			if matches := arm64LongDirective.FindStringSubmatch(line); matches != nil {
 				if currentConstPool != nil {
+					// Flush any partial byte accumulation
+					if byteCount > 0 {
+						currentConstPool.Data = append(currentConstPool.Data, byteAccum)
+						currentConstPool.Size += 4
+						byteAccum = 0
+						byteCount = 0
+					}
 					val := parseIntValue(matches[1])
 					currentConstPool.Data = append(currentConstPool.Data, uint32(val))
 					currentConstPool.Size += 4
@@ -540,10 +563,32 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 			}
 			if matches := arm64QuadDirective.FindStringSubmatch(line); matches != nil {
 				if currentConstPool != nil {
+					// Flush any partial byte accumulation
+					if byteCount > 0 {
+						currentConstPool.Data = append(currentConstPool.Data, byteAccum)
+						currentConstPool.Size += 4
+						byteAccum = 0
+						byteCount = 0
+					}
 					val := parseIntValue(matches[1])
 					// Store quad as two 32-bit words (little-endian)
 					currentConstPool.Data = append(currentConstPool.Data, uint32(val), uint32(val>>32))
 					currentConstPool.Size += 8
+				}
+				continue
+			}
+			if matches := arm64ByteDirective.FindStringSubmatch(line); matches != nil {
+				if currentConstPool != nil {
+					val := parseIntValue(matches[1])
+					// Accumulate bytes into 32-bit words (little-endian)
+					byteAccum |= uint32(val&0xFF) << (byteCount * 8)
+					byteCount++
+					if byteCount == 4 {
+						currentConstPool.Data = append(currentConstPool.Data, byteAccum)
+						currentConstPool.Size += 4
+						byteAccum = 0
+						byteCount = 0
+					}
 				}
 				continue
 			}
@@ -552,9 +597,17 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 		// Check for section change that exits literal section
 		if strings.HasPrefix(strings.TrimSpace(line), ".section") && !arm64LiteralSection.MatchString(line) {
 			inLiteralSection = false
-			// Save current constant pool if any
-			if currentConstPool != nil && len(currentConstPool.Data) > 0 {
-				constPools[currentConstLabel] = currentConstPool
+			// Flush partial byte accumulation and save current constant pool
+			if currentConstPool != nil {
+				if byteCount > 0 {
+					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
+					currentConstPool.Size += 4
+					byteAccum = 0
+					byteCount = 0
+				}
+				if len(currentConstPool.Data) > 0 {
+					constPools[currentConstLabel] = currentConstPool
+				}
 				currentConstPool = nil
 				currentConstLabel = ""
 			}
@@ -642,8 +695,14 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 	}
 
 	// Save any remaining constant pool
-	if currentConstPool != nil && len(currentConstPool.Data) > 0 {
-		constPools[currentConstLabel] = currentConstPool
+	if currentConstPool != nil {
+		if byteCount > 0 {
+			currentConstPool.Data = append(currentConstPool.Data, byteAccum)
+			currentConstPool.Size += 4
+		}
+		if len(currentConstPool.Data) > 0 {
+			constPools[currentConstLabel] = currentConstPool
+		}
 	}
 
 	if err = scanner.Err(); err != nil {

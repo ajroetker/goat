@@ -46,6 +46,8 @@ var (
 	riscv64WordDirective = regexp.MustCompile(`^\s+\.word\s+(0x[0-9a-fA-F]+|\d+)`)
 	// Match .dword directive with hex or decimal value
 	riscv64DwordDirective = regexp.MustCompile(`^\s+\.dword\s+(0x[0-9a-fA-F]+|\d+)`)
+	// Match .byte directive with hex or decimal value
+	riscv64ByteDirective = regexp.MustCompile(`^\s+\.byte\s+(0x[0-9a-fA-F]+|\d+)`)
 	// Match section directive for rodata
 	riscv64RodataSection = regexp.MustCompile(`^\s+\.section\s+\.rodata`)
 	// Match auipc instruction referencing constant pool with %pcrel_hi
@@ -183,6 +185,8 @@ func (p *RISCV64Parser) parseAssembly(path string) (map[string][]*riscv64Line, m
 		inRodataSection   bool
 		currentConstPool  *riscv64ConstPool
 		currentConstLabel string
+		byteAccum         uint32 // accumulates .byte values into 32-bit words (little-endian)
+		byteCount         int    // number of bytes accumulated (0-3)
 	)
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -196,9 +200,17 @@ func (p *RISCV64Parser) parseAssembly(path string) (map[string][]*riscv64Line, m
 
 		// Check for constant pool label (.LCPI0_0:)
 		if riscv64ConstPoolLabel.MatchString(line) {
-			// Save previous constant pool if any
-			if currentConstPool != nil && len(currentConstPool.Data) > 0 {
-				constPools[currentConstLabel] = currentConstPool
+			// Flush partial byte accumulation and save previous constant pool
+			if currentConstPool != nil {
+				if byteCount > 0 {
+					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
+					currentConstPool.Size += 4
+					byteAccum = 0
+					byteCount = 0
+				}
+				if len(currentConstPool.Data) > 0 {
+					constPools[currentConstLabel] = currentConstPool
+				}
 			}
 			// Start new constant pool
 			labelPart := strings.Split(line, ":")[0]
@@ -212,10 +224,17 @@ func (p *RISCV64Parser) parseAssembly(path string) (map[string][]*riscv64Line, m
 			continue
 		}
 
-		// Parse .word directives for constant pool data
+		// Parse .word/.dword/.byte directives for constant pool data
 		if inRodataSection || currentConstPool != nil {
 			if matches := riscv64WordDirective.FindStringSubmatch(line); matches != nil {
 				if currentConstPool != nil {
+					// Flush any partial byte accumulation
+					if byteCount > 0 {
+						currentConstPool.Data = append(currentConstPool.Data, byteAccum)
+						currentConstPool.Size += 4
+						byteAccum = 0
+						byteCount = 0
+					}
 					val := riscv64ParseIntValue(matches[1])
 					currentConstPool.Data = append(currentConstPool.Data, uint32(val))
 					currentConstPool.Size += 4
@@ -224,10 +243,32 @@ func (p *RISCV64Parser) parseAssembly(path string) (map[string][]*riscv64Line, m
 			}
 			if matches := riscv64DwordDirective.FindStringSubmatch(line); matches != nil {
 				if currentConstPool != nil {
+					// Flush any partial byte accumulation
+					if byteCount > 0 {
+						currentConstPool.Data = append(currentConstPool.Data, byteAccum)
+						currentConstPool.Size += 4
+						byteAccum = 0
+						byteCount = 0
+					}
 					val := riscv64ParseIntValue(matches[1])
 					// Store dword as two 32-bit words (little-endian)
 					currentConstPool.Data = append(currentConstPool.Data, uint32(val), uint32(val>>32))
 					currentConstPool.Size += 8
+				}
+				continue
+			}
+			if matches := riscv64ByteDirective.FindStringSubmatch(line); matches != nil {
+				if currentConstPool != nil {
+					val := riscv64ParseIntValue(matches[1])
+					// Accumulate bytes into 32-bit words (little-endian)
+					byteAccum |= uint32(val&0xFF) << (byteCount * 8)
+					byteCount++
+					if byteCount == 4 {
+						currentConstPool.Data = append(currentConstPool.Data, byteAccum)
+						currentConstPool.Size += 4
+						byteAccum = 0
+						byteCount = 0
+					}
 				}
 				continue
 			}
@@ -236,9 +277,17 @@ func (p *RISCV64Parser) parseAssembly(path string) (map[string][]*riscv64Line, m
 		// Check for section change that exits rodata section
 		if strings.HasPrefix(strings.TrimSpace(line), ".section") && !riscv64RodataSection.MatchString(line) {
 			inRodataSection = false
-			// Save current constant pool if any
-			if currentConstPool != nil && len(currentConstPool.Data) > 0 {
-				constPools[currentConstLabel] = currentConstPool
+			// Flush partial byte accumulation and save current constant pool
+			if currentConstPool != nil {
+				if byteCount > 0 {
+					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
+					currentConstPool.Size += 4
+					byteAccum = 0
+					byteCount = 0
+				}
+				if len(currentConstPool.Data) > 0 {
+					constPools[currentConstLabel] = currentConstPool
+				}
 				currentConstPool = nil
 				currentConstLabel = ""
 			}
@@ -247,8 +296,16 @@ func (p *RISCV64Parser) parseAssembly(path string) (map[string][]*riscv64Line, m
 		// Check for .text section which also exits rodata
 		if strings.HasPrefix(strings.TrimSpace(line), ".text") {
 			inRodataSection = false
-			if currentConstPool != nil && len(currentConstPool.Data) > 0 {
-				constPools[currentConstLabel] = currentConstPool
+			if currentConstPool != nil {
+				if byteCount > 0 {
+					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
+					currentConstPool.Size += 4
+					byteAccum = 0
+					byteCount = 0
+				}
+				if len(currentConstPool.Data) > 0 {
+					constPools[currentConstLabel] = currentConstPool
+				}
 				currentConstPool = nil
 				currentConstLabel = ""
 			}
@@ -285,8 +342,14 @@ func (p *RISCV64Parser) parseAssembly(path string) (map[string][]*riscv64Line, m
 	}
 
 	// Save any remaining constant pool
-	if currentConstPool != nil && len(currentConstPool.Data) > 0 {
-		constPools[currentConstLabel] = currentConstPool
+	if currentConstPool != nil {
+		if byteCount > 0 {
+			currentConstPool.Data = append(currentConstPool.Data, byteAccum)
+			currentConstPool.Size += 4
+		}
+		if len(currentConstPool.Data) > 0 {
+			constPools[currentConstLabel] = currentConstPool
+		}
 	}
 
 	if err = scanner.Err(); err != nil {
