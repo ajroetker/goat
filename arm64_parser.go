@@ -51,11 +51,20 @@ var (
 	arm64SingleRegLine = regexp.MustCompile(`^\s*(str|ldr)\s+`)
 	// Match explicit stack deallocation: "add sp, sp, #N" with hex or decimal, optional lsl #12
 	arm64StackDeallocLine = regexp.MustCompile(`^\s*add\s+sp,\s*sp,\s*#(0x[0-9a-fA-F]+|\d+)(?:,\s*lsl\s*#(\d+))?`)
+	// Match frame pointer or register setup from SP: "add xN, sp, #N" (NOT "add sp, sp, #N")
+	arm64AddFromSpLine = regexp.MustCompile(`^\s*add\s+x(\d+),\s*sp,\s*#`)
+	// Match frame pointer restore to SP: "sub sp, xN, #N" (epilogue counterpart of add xN, sp, #N)
+	arm64SubSpFromRegLine = regexp.MustCompile(`^\s*sub\s+sp,\s*x(\d+),\s*#`)
 
 	// Match rdsvl instruction: "rdsvl xN, #M" — reads streaming vector length
 	arm64RdsvlLine = regexp.MustCompile(`^\s*rdsvl\s+x(\d+),\s*#(\d+)`)
 	// Match msub with same source regs: "msub xA, xB, xB, xC" — computes xC - xB*xB
 	arm64MsubSameRegLine = regexp.MustCompile(`^\s*msub\s+x\d+,\s*x(\d+),\s*x(\d+),\s*x\d+`)
+
+	// Match "mov sp, xN" — dynamic SP write from register (VLA allocation or SP restore)
+	arm64MovToSpLine = regexp.MustCompile(`^\s*mov\s+sp,\s*x(\d+)`)
+	// Match "mov xN, sp" — save SP to register (before VLA allocation)
+	arm64MovFromSpLine = regexp.MustCompile(`^\s*mov\s+x(\d+),\s*sp`)
 
 	// Constant pool patterns
 	// Match constant pool labels: lCPI0_0:, LCPI0_0:, .LCPI0_0:, .lCPI0_0:, CPI0_0:
@@ -99,6 +108,11 @@ type arm64Line struct {
 	// the pre-decrement and sub-sp need their offsets shifted up by M
 	// to account for GOAT's merged frame.
 	SpOffset int
+	// DynAllocPad controls transformation for dynamic stack allocation (VLAs).
+	// 0: no transformation (default)
+	// -1: NOP (remove instruction, e.g., mov sp, xN)
+	// >0: transform "mov xN, sp" to "add xN, sp, #DynAllocPad"
+	DynAllocPad int
 }
 
 // arm64ConstPool represents a constant pool entry with its label and data
@@ -169,6 +183,25 @@ func parseArm64Immediate(immStr, shiftStr string) (int, error) {
 
 func (line *arm64Line) transformStackInstruction() (string, bool) {
 	asm := line.Assembly
+
+	// Handle dynamic allocation (VLA) transformations
+	if line.DynAllocPad == -1 {
+		return "", true // NOP: remove mov sp, xN
+	}
+	if line.DynAllocPad > 0 {
+		// Transform "mov xN, sp" (= add xN, sp, #0) to "add xN, sp, #pad, lsl #12"
+		// so VLA pointers computed as (xN - VLA_size) land within the enlarged frame.
+		binary, err := strconv.ParseUint(line.Binary, 16, 32)
+		if err != nil {
+			return "", false
+		}
+		rd := binary & 0x1f // Extract destination register (bits 4:0)
+		// Encode: ADD Xd, SP, #(pad >> 12), LSL #12
+		// sf=1 op=0 S=0 10001 sh=1 imm12 Rn=31(sp) Rd
+		padImm12 := uint64(line.DynAllocPad >> 12)
+		newBinary := uint64(0x91400000) | (padImm12 << 10) | (31 << 5) | rd
+		return fmt.Sprintf("%08x", newBinary), true
+	}
 
 	// Skip explicit stack allocation/deallocation - Go handles this
 	if arm64StackAllocLine.MatchString(asm) || arm64StackDeallocLine.MatchString(asm) {
@@ -280,10 +313,28 @@ func (line *arm64Line) String() string {
 		builder.WriteString(fmt.Sprintf("%s %s\n", instruction, label))
 	} else if line.SpOffset > 0 {
 		// Callee-save instruction that needs sp-relative offset adjustment.
-		// This handles signed-offset stp/ldp between the pre-decrement and sub-sp.
+		// This handles signed-offset stp/ldp between the pre-decrement and sub-sp,
+		// and also "add xN, sp, #imm" frame pointer setup instructions.
 		binary, err := strconv.ParseUint(line.Binary, 16, 32)
 		if err == nil {
-			if arm64SingleRegLine.MatchString(line.Assembly) {
+			if arm64AddFromSpLine.MatchString(line.Assembly) || arm64SubSpFromRegLine.MatchString(line.Assembly) {
+				// ADD Xd, SP, #imm (frame pointer setup) or SUB SP, Xn, #imm (frame pointer restore):
+				// imm12 at bits 21:10. Same encoding layout, only bit 30 (op) differs.
+				// Encoding: sf=1 op S=0 100010 sh imm12 Rn Rd
+				// sh=0: imm12 is unshifted. sh=1: imm12 is LSL #12.
+				sh := (binary >> 22) & 1
+				imm12 := (binary >> 10) & 0xfff
+				if sh == 0 {
+					newImm12 := imm12 + uint64(line.SpOffset)
+					binary &^= 0xfff << 10
+					binary |= (newImm12 & 0xfff) << 10
+				} else {
+					// Shifted immediate: adjust by SpOffset >> 12 (only if aligned)
+					newImm12 := imm12 + uint64(line.SpOffset>>12)
+					binary &^= 0xfff << 10
+					binary |= (newImm12 & 0xfff) << 10
+				}
+			} else if arm64SingleRegLine.MatchString(line.Assembly) {
 				// STR/LDR with unsigned offset: imm12 at bits 21:10, scaled by 8 for 64-bit
 				// Bits [31:30] = size, [25:24] = 01 for unsigned offset
 				if (binary>>24)&3 == 1 { // unsigned offset form
@@ -438,7 +489,7 @@ func (p *ARM64Parser) Prologue() string {
 // TranslateAssembly implements the full translation pipeline for ARM64
 func (p *ARM64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) error {
 	// Parse assembly
-	assembly, stackSizes, dynSVLAlloc, constPools, err := p.parseAssembly(t.Assembly, t.TargetOS)
+	assembly, stackSizes, preDecSizes, dynSVLAlloc, dynRegAlloc, constPools, err := p.parseAssembly(t.Assembly, t.TargetOS)
 	if err != nil {
 		return err
 	}
@@ -459,9 +510,12 @@ func (p *ARM64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) 
 		assembly[fnName] = TransformSVEFunction(lines)
 	}
 
-	// Copy stack sizes to functions
+	// Copy stack sizes to functions, setting SpillBase to the original C frame size
+	// before adding dynamic allocation padding. SpillBase is where overflow args
+	// are placed — it must match the offset the C body expects to read them at.
 	for i, fn := range functions {
 		if sz, ok := stackSizes[fn.Name]; ok {
+			functions[i].SpillBase = sz // Original C frame size for overflow arg placement
 			// Add dynamic SVL-based stack allocation if detected.
 			// rdsvl+msub allocates SVL^2 bytes at runtime. We must declare
 			// enough frame space for the worst-case SVL. ARM SME allows
@@ -471,18 +525,26 @@ func (p *ARM64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) 
 				const maxSVLBytes = 256 // ARM architectural maximum
 				sz += maxSVLBytes * maxSVLBytes
 			}
+			// Add padding for register-based dynamic stack allocation (VLAs).
+			// Functions with "mov sp, xN" allocate runtime-sized arrays on the stack.
+			// We enlarge the frame to accommodate worst-case VLA size.
+			if dynRegAlloc[fn.Name] {
+				const maxDynAllocBytes = 131072 // 128KB for VLAs
+				sz += maxDynAllocBytes
+			}
 			functions[i].StackSize = sz
 		}
 	}
+	_ = preDecSizes // preDecSizes already consumed during callee-save adjustment in parseAssembly
 
 	// Generate Go assembly with constant pools
 	return p.generateGoAssembly(t, functions, assembly, constPools)
 }
 
-func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]*arm64Line, map[string]int, map[string]bool, map[string]*arm64ConstPool, error) {
+func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]*arm64Line, map[string]int, map[string]int, map[string]bool, map[string]bool, map[string]*arm64ConstPool, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 	defer func(file *os.File) {
 		if err = file.Close(); err != nil {
@@ -495,6 +557,7 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 		stackSizes     = make(map[string]int)
 		preDecSizes    = make(map[string]int)         // pre-decrement prologue sizes per function
 		hasDynSVLAlloc = make(map[string]bool)        // functions with rdsvl+msub dynamic stack alloc
+		hasDynRegAlloc = make(map[string]bool)        // functions with register-based dynamic SP adjustment (VLAs)
 		rdsvlRegs      = make(map[string]map[int]int) // funcName -> {regNum: multiplier} from rdsvl
 		functions      = make(map[string][]*arm64Line)
 		constPools     = make(map[string]*arm64ConstPool)
@@ -682,6 +745,14 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 				}
 			}
 
+			// Detect dynamic register-based stack allocation (VLAs):
+			// "mov sp, xN" indicates runtime SP adjustment from a register.
+			// This is distinct from "sub sp, sp, #imm" (immediate, already handled)
+			// and rdsvl+msub (SVL VLAs, handled above).
+			if arm64MovToSpLine.MatchString(asm) {
+				hasDynRegAlloc[functionName] = true
+			}
+
 			if labelName == "" {
 				functions[functionName] = append(functions[functionName], &arm64Line{Assembly: asm})
 			} else {
@@ -706,7 +777,7 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 	}
 
 	if err = scanner.Err(); err != nil {
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, nil, err
 	}
 
 	// Adjust callee-save offsets for functions with pre-decrement prologues.
@@ -723,7 +794,9 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 
 		lines := functions[fn]
 
-		// Forward pass: mark prologue callee saves (pre-dec through first sub sp)
+		// Forward pass: mark prologue callee saves (pre-dec through first sub sp).
+		// Also adjusts "add xN, sp, #imm" instructions (frame pointer setup) which
+		// use sp as a register operand rather than in a memory address.
 		foundPreDec := false
 		for _, line := range lines {
 			if arm64StackPreDecLine.MatchString(line.Assembly) {
@@ -735,7 +808,7 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 				if arm64StackAllocLine.MatchString(line.Assembly) {
 					break // Reached the sub sp, stop
 				}
-				if spRelativeLine.MatchString(line.Assembly) {
+				if spRelativeLine.MatchString(line.Assembly) || arm64AddFromSpLine.MatchString(line.Assembly) {
 					line.SpOffset = subSpSize
 				}
 			}
@@ -751,6 +824,11 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 					prev := lines[j]
 					if arm64StackDeallocLine.MatchString(prev.Assembly) {
 						continue // Skip add sp (will be removed)
+					}
+					if arm64SubSpFromRegLine.MatchString(prev.Assembly) {
+						// "sub sp, xN, #imm" (frame pointer restore) needs offset adjustment
+						prev.SpOffset = subSpSize
+						continue
 					}
 					if !spRelativeLine.MatchString(prev.Assembly) {
 						break // Not an sp-relative instruction, stop
@@ -813,7 +891,25 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 		}
 	}
 
-	return functions, stackSizes, hasDynSVLAlloc, constPools, nil
+	// Mark instructions for dynamic register-based allocation (VLA) transformation.
+	// When a function has "mov sp, xN" (VLA alloc), we:
+	// 1. NOP "mov sp, xN" — Go manages SP, don't allow dynamic adjustment
+	// 2. Transform "mov xN, sp" to "add xN, sp, #pad" — VLA pointers land within enlarged frame
+	const maxDynAllocBytes = 131072 // 128KB, accommodates VLAs up to ~128KB
+	for fn, hasDyn := range hasDynRegAlloc {
+		if !hasDyn {
+			continue
+		}
+		for _, line := range functions[fn] {
+			if arm64MovToSpLine.MatchString(line.Assembly) {
+				line.DynAllocPad = -1 // NOP
+			} else if arm64MovFromSpLine.MatchString(line.Assembly) {
+				line.DynAllocPad = maxDynAllocBytes // Transform
+			}
+		}
+	}
+
+	return functions, stackSizes, preDecSizes, hasDynSVLAlloc, hasDynRegAlloc, constPools, nil
 }
 
 // parseIntValue parses a decimal or hex integer value from a string
@@ -1031,8 +1127,13 @@ func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 
 		// Overflow args must be placed above the C function's local variables.
 		// The C compiler emits code that reads overflow args at [sp + localFrameSize],
-		// so we store them at RSP + function.StackSize.
-		spillBase := function.StackSize
+		// so we store them at RSP + SpillBase (the original C frame size, before
+		// dynamic allocation padding like VLAs). When there's no dynamic padding,
+		// SpillBase equals StackSize.
+		spillBase := function.SpillBase
+		if spillBase == 0 {
+			spillBase = function.StackSize
+		}
 		stackOffset := 0
 		if len(stack) > 0 {
 			for i := 0; i < len(stack); i++ {

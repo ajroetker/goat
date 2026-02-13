@@ -50,6 +50,14 @@ var (
 	// Match "popq %rbx" etc - callee-saved register pop
 	amd64CalleeSavePop = regexp.MustCompile(`popq\s+%(rbx|rbp|r1[2-5])`)
 
+	// Dynamic stack allocation patterns (VLAs)
+	// Match register-based RSP subtraction: "subq %rN, %rsp" — VLA allocation
+	amd64DynStackSubLine = regexp.MustCompile(`subq\s+%(r\w+),\s*%rsp`)
+	// Match register-based RSP write: "movq %rN, %rsp" — SP restore from saved value
+	amd64MovToRspLine = regexp.MustCompile(`movq\s+%(r\w+),\s*%rsp`)
+	// Match RSP save to register: "movq %rsp, %rN" — save SP before VLA allocation
+	amd64MovFromRspLine = regexp.MustCompile(`movq\s+%rsp,\s*%(r\w+)`)
+
 	// Constant pool patterns
 	// Match constant pool labels: .LCPI0_0: (Linux) or LCPI0_0: (macOS)
 	amd64ConstPoolLabel = regexp.MustCompile(`^\.?LCPI\d+_\d+:`)
@@ -80,6 +88,11 @@ type amd64Line struct {
 	Labels   []string
 	Assembly string
 	Binary   []string
+	// DynAllocPad controls transformation for dynamic stack allocation (VLAs).
+	// 0: no transformation (default)
+	// -1: skip (NOP, for subq %rN, %rsp and movq %rN, %rsp)
+	// >0: transform "movq %rsp, %rN" to "leaq pad(%rsp), %rN"
+	DynAllocPad int
 }
 
 // amd64ConstPool represents a constant pool entry with its label and data
@@ -91,6 +104,65 @@ type amd64ConstPool struct {
 
 func (line *amd64Line) String() string {
 	var builder strings.Builder
+
+	// Handle VLA transformation: replace "movq %rsp, %rN" with "leaq pad(%rsp), %rN"
+	if line.DynAllocPad > 0 {
+		matches := amd64MovFromRspLine.FindStringSubmatch(line.Assembly)
+		if len(matches) >= 2 {
+			regName := matches[1]
+			regNum := amd64RegNum(regName)
+			if regNum >= 0 {
+				// Encode: leaq disp32(%rsp), %rN
+				// REX.W (+ REX.R for r8-r15) | 0x8D | ModRM(mod=10,reg,rm=4/SIB) | SIB(00,100,100) | disp32
+				rex := byte(0x48)
+				regField := byte(regNum & 7)
+				if regNum >= 8 {
+					rex |= 0x04 // REX.R
+				}
+				modRM := byte(0x84) | (regField << 3) // mod=10, reg=regField, rm=4(SIB)
+				sib := byte(0x24)                      // scale=0, index=4(none), base=4(rsp)
+				pad := uint32(line.DynAllocPad)
+				binary := []string{
+					fmt.Sprintf("%02x", rex),
+					"8d",
+					fmt.Sprintf("%02x", modRM),
+					fmt.Sprintf("%02x", sib),
+					fmt.Sprintf("%02x", pad&0xff),
+					fmt.Sprintf("%02x", (pad>>8)&0xff),
+					fmt.Sprintf("%02x", (pad>>16)&0xff),
+					fmt.Sprintf("%02x", (pad>>24)&0xff),
+				}
+				// Temporarily replace binary for emission
+				origBinary := line.Binary
+				line.Binary = binary
+				builder.WriteString("\t")
+				// Emit using standard binary encoding logic
+				pos := 0
+				for pos < len(line.Binary) {
+					if pos > 0 {
+						builder.WriteString("; ")
+					}
+					if len(line.Binary)-pos >= 8 {
+						builder.WriteString(fmt.Sprintf("QUAD $0x%v%v%v%v%v%v%v%v",
+							line.Binary[pos+7], line.Binary[pos+6], line.Binary[pos+5], line.Binary[pos+4],
+							line.Binary[pos+3], line.Binary[pos+2], line.Binary[pos+1], line.Binary[pos]))
+						pos += 8
+					} else if len(line.Binary)-pos >= 4 {
+						builder.WriteString(fmt.Sprintf("LONG $0x%v%v%v%v",
+							line.Binary[pos+3], line.Binary[pos+2], line.Binary[pos+1], line.Binary[pos]))
+						pos += 4
+					} else {
+						builder.WriteString(fmt.Sprintf("BYTE $0x%v", line.Binary[pos]))
+						pos++
+					}
+				}
+				builder.WriteString(fmt.Sprintf("\t// leaq %d(%%rsp), %%%s [VLA transformed]\n", line.DynAllocPad, regName))
+				line.Binary = origBinary
+				return builder.String()
+			}
+		}
+	}
+
 	builder.WriteString("\t")
 	if strings.HasPrefix(line.Assembly, "j") {
 		// Handle both Linux (jl .LBB0_1) and macOS (jl LBB0_1) jump formats
@@ -150,7 +222,13 @@ func (line *amd64Line) getConstPoolLabel() string {
 // - pushq/popq of callee-saved registers (rbx, rbp, r12-r15)
 // - subq $N, %rsp (stack allocation)
 // - addq $N, %rsp (stack deallocation)
+// - dynamic SP modifications from VLAs (when DynAllocPad == -1)
 func (line *amd64Line) shouldSkip() bool {
+	// Skip instructions marked for NOP by VLA handling
+	if line.DynAllocPad == -1 {
+		return true
+	}
+
 	asm := line.Assembly
 
 	// Skip callee-saved register push/pop
@@ -237,7 +315,7 @@ func (p *AMD64Parser) Prologue() string {
 // TranslateAssembly implements the full translation pipeline for AMD64
 func (p *AMD64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) error {
 	// Parse assembly
-	assembly, stackSizes, constPools, err := p.parseAssembly(t.Assembly, t.TargetOS)
+	assembly, stackSizes, dynRegAlloc, constPools, err := p.parseAssembly(t.Assembly, t.TargetOS)
 	if err != nil {
 		return err
 	}
@@ -253,9 +331,17 @@ func (p *AMD64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) 
 		return err
 	}
 
-	// Copy stack sizes to functions
+	// Copy stack sizes to functions, setting SpillBase to the original C frame size
+	// before adding dynamic allocation padding. SpillBase is where overflow args
+	// are placed — it must match the offset the C body expects to read them at.
 	for i, fn := range functions {
 		if sz, ok := stackSizes[fn.Name]; ok {
+			functions[i].SpillBase = sz // Original C frame size for overflow arg placement
+			// Add padding for register-based dynamic stack allocation (VLAs).
+			if dynRegAlloc[fn.Name] {
+				const maxDynAllocBytes = 131072 // 128KB for VLAs
+				sz += maxDynAllocBytes
+			}
 			functions[i].StackSize = sz
 		}
 	}
@@ -264,10 +350,10 @@ func (p *AMD64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) 
 	return p.generateGoAssembly(t, functions, assembly, constPools)
 }
 
-func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]*amd64Line, map[string]int, map[string]*amd64ConstPool, error) {
+func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]*amd64Line, map[string]int, map[string]bool, map[string]*amd64ConstPool, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 	defer func(file *os.File) {
 		if err = file.Close(); err != nil {
@@ -277,11 +363,12 @@ func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]
 	}(file)
 
 	var (
-		stackSizes   = make(map[string]int)
-		functions    = make(map[string][]*amd64Line)
-		constPools   = make(map[string]*amd64ConstPool)
-		functionName string
-		labelName    string
+		stackSizes     = make(map[string]int)
+		hasDynRegAlloc = make(map[string]bool) // functions with register-based dynamic SP adjustment (VLAs)
+		functions      = make(map[string][]*amd64Line)
+		constPools     = make(map[string]*amd64ConstPool)
+		functionName   string
+		labelName      string
 		// Constant pool parsing state
 		inRodataSection   bool
 		currentConstPool  *amd64ConstPool
@@ -450,6 +537,12 @@ func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]
 				}
 			}
 
+			// Detect dynamic register-based stack allocation (VLAs):
+			// "subq %rN, %rsp" or "movq %rN, %rsp" indicates runtime SP adjustment.
+			if amd64DynStackSubLine.MatchString(asm) || amd64MovToRspLine.MatchString(asm) {
+				hasDynRegAlloc[functionName] = true
+			}
+
 			if labelName == "" {
 				functions[functionName] = append(functions[functionName], &amd64Line{Assembly: asm})
 			} else {
@@ -476,9 +569,25 @@ func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]
 	}
 
 	if err = scanner.Err(); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	return functions, stackSizes, constPools, nil
+
+	// Mark instructions for dynamic register-based allocation (VLA) transformation.
+	const maxDynAllocBytes = 131072 // 128KB, accommodates VLAs up to ~128KB
+	for fn, hasDyn := range hasDynRegAlloc {
+		if !hasDyn {
+			continue
+		}
+		for _, line := range functions[fn] {
+			if amd64DynStackSubLine.MatchString(line.Assembly) || amd64MovToRspLine.MatchString(line.Assembly) {
+				line.DynAllocPad = -1 // NOP
+			} else if amd64MovFromRspLine.MatchString(line.Assembly) {
+				line.DynAllocPad = maxDynAllocBytes // Transform
+			}
+		}
+	}
+
+	return functions, stackSizes, hasDynRegAlloc, constPools, nil
 }
 
 // amd64ParseIntValue parses a decimal or hex integer value from a string
@@ -634,6 +743,46 @@ func amd64ToGoRegister(reg string) string {
 		return "R15"
 	}
 	return ""
+}
+
+// amd64RegNum returns the x86-64 register number for encoding (0=rax, 1=rcx, ..., 7=rdi, 8-15=r8-r15).
+// Returns -1 if the register name is not recognized.
+func amd64RegNum(reg string) int {
+	switch reg {
+	case "rax":
+		return 0
+	case "rcx":
+		return 1
+	case "rdx":
+		return 2
+	case "rbx":
+		return 3
+	case "rsp":
+		return 4
+	case "rbp":
+		return 5
+	case "rsi":
+		return 6
+	case "rdi":
+		return 7
+	case "r8":
+		return 8
+	case "r9":
+		return 9
+	case "r10":
+		return 10
+	case "r11":
+		return 11
+	case "r12":
+		return 12
+	case "r13":
+		return 13
+	case "r14":
+		return 14
+	case "r15":
+		return 15
+	}
+	return -1
 }
 
 func amd64SanitizeAsm(asm string) string {
@@ -860,8 +1009,11 @@ func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function,
 
 		// Overflow args must be placed above the C function's local variables.
 		// The C compiler emits code that reads overflow args at [rsp + localFrameSize],
-		// so we store them at SP + function.StackSize.
-		spillBase := function.StackSize
+		// so we store them at SP + SpillBase (the original C frame size, before VLA padding).
+		spillBase := function.SpillBase
+		if spillBase == 0 {
+			spillBase = function.StackSize
+		}
 		stackOffset := 0
 		if len(stack) > 0 {
 			for i := 0; i < len(stack); i++ {

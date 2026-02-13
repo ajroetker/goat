@@ -191,7 +191,7 @@ func TestARM64ParseAssemblyByteDirective(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			path := writeTestAssembly(t, tt.assembly)
-			_, _, _, constPools, err := p.parseAssembly(path, "linux")
+			_, _, _, _, _, constPools, err := p.parseAssembly(path, "linux")
 			if err != nil {
 				t.Fatalf("parseAssembly failed: %v", err)
 			}
@@ -336,7 +336,7 @@ func TestAMD64ParseAssemblyByteDirective(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			path := writeTestAssembly(t, tt.assembly)
-			_, _, constPools, err := p.parseAssembly(path, "linux")
+			_, _, _, constPools, err := p.parseAssembly(path, "linux")
 			if err != nil {
 				t.Fatalf("parseAssembly failed: %v", err)
 			}

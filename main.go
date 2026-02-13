@@ -223,7 +223,7 @@ func (t *TranslateUnit) generateGoStubs(functions []Function) error {
 func (t *TranslateUnit) compile(args ...string) error {
 	args = append(args, "-mno-red-zone", "-mllvm", "-inline-threshold=1000",
 		"-fno-asynchronous-unwind-tables", "-fno-exceptions", "-fno-rtti", "-fno-builtin",
-		"-fomit-frame-pointer")
+		"-fomit-frame-pointer", "-fno-stack-protector")
 	// Add architecture-specific compiler flags
 	args = append(args, t.parser.CompilerFlags()...)
 
@@ -431,6 +431,7 @@ type Function struct {
 	Type       string
 	Parameters []Parameter
 	StackSize  int
+	SpillBase  int // Offset for overflow arg storage; 0 means use StackSize
 }
 
 // convertFunction extracts the function definition from cc.DirectDeclarator.
