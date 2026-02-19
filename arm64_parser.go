@@ -38,7 +38,11 @@ var (
 	arm64LabelLine = regexp.MustCompile(`^\.?\w+_\d+:.*$`)
 	arm64CodeLine  = regexp.MustCompile(`^\s+\w+.*$`)
 	// Match jumps to labels with or without leading dot
-	arm64JmpLine    = regexp.MustCompile(`^(b|b\.\w{2})\t\.?\w+_\d+$`)
+	arm64JmpLine = regexp.MustCompile(`^(b|b\.\w{2})\t\.?\w+_\d+$`)
+	// Match CBZ/CBNZ: "cbz x10, LBB0_40" or "cbnz w8, .LBB0_5"
+	arm64CbzLine = regexp.MustCompile(`^(cbz|cbnz)\t(\w+),\s*\.?(\w+_\d+)$`)
+	// Match TBZ/TBNZ: "tbz w12, #0, LBB0_21" or "tbnz x5, #31, .LBB0_3"
+	arm64TbzLine = regexp.MustCompile(`^(tbz|tbnz)\t(\w+),\s*#(\d+),\s*\.?(\w+_\d+)$`)
 	arm64SymbolLine = regexp.MustCompile(`^\w+\s+<\w+>:$`)
 	arm64DataLine   = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
 	// Match stack frame allocation: "sub sp, sp, #N" with hex or decimal, optional lsl #12
@@ -311,6 +315,27 @@ func (line *arm64Line) String() string {
 		label = strings.TrimPrefix(label, ".")
 		label = strings.TrimPrefix(label, "L")
 		builder.WriteString(fmt.Sprintf("%s %s\n", instruction, label))
+	} else if m := arm64CbzLine.FindStringSubmatch(line.Assembly); m != nil {
+		// CBZ/CBNZ: emit as Go mnemonic with label reference so the assembler
+		// resolves offsets correctly (raw WORD offsets break when RET expands).
+		mnemonic := strings.ToUpper(m[1]) // "CBZ" or "CBNZ"
+		reg := m[2]                       // e.g., "x10" or "w8"
+		label := m[3]                     // e.g., "LBB0_40"
+		if strings.HasPrefix(reg, "w") {
+			mnemonic += "W"
+		}
+		goReg := goRegisterName(reg)
+		label = strings.TrimPrefix(label, "L")
+		builder.WriteString(fmt.Sprintf("\t%s %s, %s\n", mnemonic, goReg, label))
+	} else if m := arm64TbzLine.FindStringSubmatch(line.Assembly); m != nil {
+		// TBZ/TBNZ: emit as Go mnemonic with bit, register, and label reference.
+		mnemonic := strings.ToUpper(m[1]) // "TBZ" or "TBNZ"
+		reg := m[2]                       // e.g., "w12" or "x5"
+		bit := m[3]                       // e.g., "0"
+		label := m[4]                     // e.g., "LBB0_21"
+		goReg := goRegisterName(reg)
+		label = strings.TrimPrefix(label, "L")
+		builder.WriteString(fmt.Sprintf("\t%s $%s, %s, %s\n", mnemonic, bit, goReg, label))
 	} else if line.SpOffset > 0 {
 		// Callee-save instruction that needs sp-relative offset adjustment.
 		// This handles signed-offset stp/ldp between the pre-decrement and sub-sp,
