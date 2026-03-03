@@ -15,13 +15,11 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
-	"unicode"
 
 	"github.com/klauspost/asmfmt"
 	"github.com/samber/lo"
@@ -32,13 +30,9 @@ type AMD64Parser struct{}
 
 // amd64 regex patterns
 var (
-	amd64AttributeLine = regexp.MustCompile(`^\s+\..+$`)
-	amd64NameLine      = regexp.MustCompile(`^\w+:.+$`)
 	// Match labels like .LBB0_2: (Linux) or LBB0_2: (macOS)
 	amd64LabelLine  = regexp.MustCompile(`^\.?\w+_\d+:.*$`)
-	amd64CodeLine   = regexp.MustCompile(`^\s+\w+.+$`)
-	amd64SymbolLine = regexp.MustCompile(`^\w+\s+<\w+>:$`)
-	amd64DataLine   = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
+	amd64CodeLine = regexp.MustCompile(`^\s+\w+.+$`)
 
 	// Stack management patterns - these need to be removed since Go handles the frame
 	// Match "subq $N, %rsp" - stack allocation
@@ -95,13 +89,6 @@ type amd64Line struct {
 	DynAllocPad int
 }
 
-// amd64ConstPool represents a constant pool entry with its label and data
-type amd64ConstPool struct {
-	Label string   // e.g., "CPI0_0" (without leading L or .)
-	Data  []uint32 // Data as 32-bit words (for .long directives)
-	Size  int      // Total size in bytes
-}
-
 func (line *amd64Line) String() string {
 	var builder strings.Builder
 
@@ -120,7 +107,7 @@ func (line *amd64Line) String() string {
 					rex |= 0x04 // REX.R
 				}
 				modRM := byte(0x84) | (regField << 3) // mod=10, reg=regField, rm=4(SIB)
-				sib := byte(0x24)                      // scale=0, index=4(none), base=4(rsp)
+				sib := byte(0x24)                     // scale=0, index=4(none), base=4(rsp)
 				pad := uint32(line.DynAllocPad)
 				binary := []string{
 					fmt.Sprintf("%02x", rex),
@@ -168,9 +155,7 @@ func (line *amd64Line) String() string {
 		// Handle both Linux (jl .LBB0_1) and macOS (jl LBB0_1) jump formats
 		fields := strings.Fields(line.Assembly)
 		op := fields[0]
-		// Strip both . and L prefixes for consistency
-		operand := strings.TrimPrefix(fields[1], ".")
-		operand = strings.TrimPrefix(operand, "L")
+		operand := normalizeLabel(fields[1])
 		builder.WriteString(fmt.Sprintf("%s %s", strings.ToUpper(op), operand))
 	} else {
 		pos := 0
@@ -283,10 +268,10 @@ func (p *AMD64Parser) Prologue() string {
 	// Define include guards so real system intrinsic headers are skipped.
 	// The modernc.org C parser can't handle GCC/Clang builtins in these headers.
 	// All x86 SIMD types are provided as typedefs below instead.
-	prologue.WriteString("#define _IMMINTRIN_H_INCLUDED\n")   // GCC immintrin.h
-	prologue.WriteString("#define __IMMINTRIN_H 1\n")         // Clang immintrin.h
-	prologue.WriteString("#define __AVX512FP16INTRIN_H\n")    // AVX-512 FP16
-	prologue.WriteString("#define __AVX512VLFP16INTRIN_H\n")  // AVX-512 VL FP16
+	prologue.WriteString("#define _IMMINTRIN_H_INCLUDED\n")  // GCC immintrin.h
+	prologue.WriteString("#define __IMMINTRIN_H 1\n")        // Clang immintrin.h
+	prologue.WriteString("#define __AVX512FP16INTRIN_H\n")   // AVX-512 FP16
+	prologue.WriteString("#define __AVX512VLFP16INTRIN_H\n") // AVX-512 VL FP16
 	// Define scalar half-precision types for the parser
 	prologue.WriteString("typedef unsigned short __bf16;\n")   // BF16 scalar
 	prologue.WriteString("typedef unsigned short _Float16;\n") // FP16 scalar
@@ -350,33 +335,23 @@ func (p *AMD64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) 
 	return p.generateGoAssembly(t, functions, assembly, constPools)
 }
 
-func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]*amd64Line, map[string]int, map[string]bool, map[string]*amd64ConstPool, error) {
-	file, err := os.Open(path)
+func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]*amd64Line, map[string]int, map[string]bool, map[string]*ConstPool, error) {
+	scanner, cleanup, err := openAssemblyFile(path)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	defer func(file *os.File) {
-		if err = file.Close(); err != nil {
-			_, _ = fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-	}(file)
+	defer cleanup()
 
 	var (
 		stackSizes     = make(map[string]int)
 		hasDynRegAlloc = make(map[string]bool) // functions with register-based dynamic SP adjustment (VLAs)
 		functions      = make(map[string][]*amd64Line)
-		constPools     = make(map[string]*amd64ConstPool)
+		cpa            = NewConstPoolAccumulator()
 		functionName   string
 		labelName      string
 		// Constant pool parsing state
-		inRodataSection   bool
-		currentConstPool  *amd64ConstPool
-		currentConstLabel string
-		byteAccum         uint32 // accumulates .byte values into 32-bit words (little-endian)
-		byteCount         int    // number of bytes accumulated (0-3)
+		inRodataSection bool
 	)
-	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
 
@@ -388,77 +363,23 @@ func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]
 
 		// Check for constant pool label (.LCPI0_0: or LCPI0_0:)
 		if amd64ConstPoolLabel.MatchString(line) {
-			// Flush partial byte accumulation and save previous constant pool
-			if currentConstPool != nil {
-				if byteCount > 0 {
-					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-					currentConstPool.Size += 4
-					byteAccum = 0
-					byteCount = 0
-				}
-				if len(currentConstPool.Data) > 0 {
-					constPools[currentConstLabel] = currentConstPool
-				}
-			}
-			// Start new constant pool
-			labelPart := strings.Split(line, ":")[0]
-			// Normalize label: strip leading . and L, keep CPI part
-			labelPart = strings.TrimPrefix(labelPart, ".")
-			labelPart = strings.TrimPrefix(labelPart, "L")
-			currentConstLabel = labelPart
-			currentConstPool = &amd64ConstPool{
-				Label: labelPart,
-				Data:  make([]uint32, 0),
-			}
+			labelPart := normalizeLabel(strings.Split(line, ":")[0])
+			cpa.StartPool(labelPart)
 			continue
 		}
 
 		// Parse .long/.quad/.byte directives for constant pool data
-		if inRodataSection || currentConstPool != nil {
+		if inRodataSection || cpa.Active() {
 			if matches := amd64LongDirective.FindStringSubmatch(line); matches != nil {
-				if currentConstPool != nil {
-					// Flush any partial byte accumulation
-					if byteCount > 0 {
-						currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-						currentConstPool.Size += 4
-						byteAccum = 0
-						byteCount = 0
-					}
-					val := amd64ParseIntValue(matches[1])
-					currentConstPool.Data = append(currentConstPool.Data, uint32(val))
-					currentConstPool.Size += 4
-				}
+				cpa.AddLong(parseIntValue(matches[1]))
 				continue
 			}
 			if matches := amd64QuadDirective.FindStringSubmatch(line); matches != nil {
-				if currentConstPool != nil {
-					// Flush any partial byte accumulation
-					if byteCount > 0 {
-						currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-						currentConstPool.Size += 4
-						byteAccum = 0
-						byteCount = 0
-					}
-					val := amd64ParseIntValue(matches[1])
-					// Store quad as two 32-bit words (little-endian)
-					currentConstPool.Data = append(currentConstPool.Data, uint32(val), uint32(val>>32))
-					currentConstPool.Size += 8
-				}
+				cpa.AddQuad(parseIntValue(matches[1]))
 				continue
 			}
 			if matches := amd64ByteDirective.FindStringSubmatch(line); matches != nil {
-				if currentConstPool != nil {
-					val := amd64ParseIntValue(matches[1])
-					// Accumulate bytes into 32-bit words (little-endian)
-					byteAccum |= uint32(val&0xFF) << (byteCount * 8)
-					byteCount++
-					if byteCount == 4 {
-						currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-						currentConstPool.Size += 4
-						byteAccum = 0
-						byteCount = 0
-					}
-				}
+				cpa.AccumulateByte(parseIntValue(matches[1]))
 				continue
 			}
 		}
@@ -466,56 +387,28 @@ func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]
 		// Check for section change that exits rodata section
 		if strings.HasPrefix(strings.TrimSpace(line), ".section") && !amd64RodataSection.MatchString(line) {
 			inRodataSection = false
-			// Flush partial byte accumulation and save current constant pool
-			if currentConstPool != nil {
-				if byteCount > 0 {
-					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-					currentConstPool.Size += 4
-					byteAccum = 0
-					byteCount = 0
-				}
-				if len(currentConstPool.Data) > 0 {
-					constPools[currentConstLabel] = currentConstPool
-				}
-				currentConstPool = nil
-				currentConstLabel = ""
-			}
+			cpa.FinishPool()
 		}
 
 		// Check for .text section which also exits rodata
 		if strings.HasPrefix(strings.TrimSpace(line), ".text") {
 			inRodataSection = false
-			if currentConstPool != nil {
-				if byteCount > 0 {
-					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-					currentConstPool.Size += 4
-					byteAccum = 0
-					byteCount = 0
-				}
-				if len(currentConstPool.Data) > 0 {
-					constPools[currentConstLabel] = currentConstPool
-				}
-				currentConstPool = nil
-				currentConstLabel = ""
-			}
+			cpa.FinishPool()
 		}
 
-		if amd64AttributeLine.MatchString(line) {
+		if attributeLine.MatchString(line) {
 			continue
 		} else if amd64LabelLine.MatchString(line) {
 			// Check labels BEFORE function names because labels like "LBB0_2: ; comment"
 			// can match the function name pattern due to content after the colon
-			labelName = strings.Split(line, ":")[0]
-			// Strip leading dot and L prefix (Linux uses .LBB0_2, macOS uses LBB0_2)
-			labelName = strings.TrimPrefix(labelName, ".")
-			labelName = strings.TrimPrefix(labelName, "L")
+			labelName = normalizeLabel(strings.Split(line, ":")[0])
 			lines := functions[functionName]
 			if len(lines) > 0 && lines[len(lines)-1].Assembly == "" {
 				lines[len(lines)-1].Labels = append(lines[len(lines)-1].Labels, labelName)
 			} else {
 				functions[functionName] = append(functions[functionName], &amd64Line{Labels: []string{labelName}})
 			}
-		} else if amd64NameLine.MatchString(line) {
+		} else if nameLine.MatchString(line) {
 			functionName = strings.Split(line, ":")[0]
 			// On macOS, function names are prefixed with underscore - strip it
 			if targetOS == "darwin" && strings.HasPrefix(functionName, "_") {
@@ -558,15 +451,8 @@ func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]
 	}
 
 	// Save any remaining constant pool
-	if currentConstPool != nil {
-		if byteCount > 0 {
-			currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-			currentConstPool.Size += 4
-		}
-		if len(currentConstPool.Data) > 0 {
-			constPools[currentConstLabel] = currentConstPool
-		}
-	}
+	cpa.FinishPool()
+	constPools := cpa.Pools()
 
 	if err = scanner.Err(); err != nil {
 		return nil, nil, nil, nil, err
@@ -588,17 +474,6 @@ func (p *AMD64Parser) parseAssembly(path string, targetOS string) (map[string][]
 	}
 
 	return functions, stackSizes, hasDynRegAlloc, constPools, nil
-}
-
-// amd64ParseIntValue parses a decimal or hex integer value from a string
-func amd64ParseIntValue(s string) uint64 {
-	s = strings.TrimSpace(s)
-	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
-		val, _ := strconv.ParseUint(s[2:], 16, 64)
-		return val
-	}
-	val, _ := strconv.ParseUint(s, 10, 64)
-	return val
 }
 
 // amd64RewriteConstPoolRef rewrites an instruction that uses RIP-relative addressing
@@ -802,30 +677,11 @@ func (p *AMD64Parser) parseObjectDump(dump string, functions map[string][]*amd64
 	)
 	for i, line := range strings.Split(dump, "\n") {
 		line = strings.TrimSpace(line)
-		if amd64SymbolLine.MatchString(line) {
-			functionName = strings.Split(line, "<")[1]
-			functionName = strings.Split(functionName, ">")[0]
-			// On macOS, function names are prefixed with underscore - strip it
-			if targetOS == "darwin" && strings.HasPrefix(functionName, "_") {
-				functionName = functionName[1:]
-			}
+		if symbolLine.MatchString(line) {
+			functionName = extractObjDumpFunctionName(line, targetOS)
 			lineNumber = 0
-		} else if amd64DataLine.MatchString(line) {
-			data := strings.Split(line, ":")[1]
-			data = strings.TrimSpace(data)
-			splits := strings.Split(data, " ")
-			var (
-				binary   []string
-				assembly string
-			)
-			for i, s := range splits {
-				if s == "" || unicode.IsSpace(rune(s[0])) {
-					assembly = strings.Join(splits[i:], " ")
-					assembly = strings.TrimSpace(assembly)
-					break
-				}
-				binary = append(binary, s)
-			}
+		} else if dataLine.MatchString(line) {
+			binary, assembly := parseObjDumpDataLine(line)
 
 			assembly = amd64SanitizeAsm(assembly)
 			if strings.Contains(assembly, "nop") {
@@ -849,25 +705,12 @@ func (p *AMD64Parser) parseObjectDump(dump string, functions map[string][]*amd64
 	return nil
 }
 
-func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function, assembly map[string][]*amd64Line, constPools map[string]*amd64ConstPool) error {
+func (p *AMD64Parser) generateGoAssembly(t *TranslateUnit, functions []Function, assembly map[string][]*amd64Line, constPools map[string]*ConstPool) error {
 	var builder strings.Builder
 	builder.WriteString(p.BuildTags())
 	t.writeHeader(&builder)
 
-	// Emit DATA/GLOBL directives for constant pools
-	if len(constPools) > 0 {
-		builder.WriteString("\n#include \"textflag.h\"\n")
-		builder.WriteString("\n// Constant pool data\n")
-		for label, pool := range constPools {
-			// Emit DATA directive with little-endian byte order
-			// Format: DATA symbol<>+offset(SB)/size, $value
-			for i, val := range pool.Data {
-				builder.WriteString(fmt.Sprintf("DATA %s<>+%d(SB)/4, $0x%08x\n", label, i*4, val))
-			}
-			// Emit GLOBL directive to define the symbol size
-			builder.WriteString(fmt.Sprintf("GLOBL %s<>(SB), (RODATA|NOPTR), $%d\n", label, pool.Size))
-		}
-	}
+	emitConstPools(&builder, constPools)
 
 	for _, function := range functions {
 		// Calculate return size based on type

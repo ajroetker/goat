@@ -15,7 +15,6 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"regexp"
@@ -32,8 +31,6 @@ type ARM64Parser struct{}
 
 // arm64 regex patterns
 var (
-	arm64AttributeLine = regexp.MustCompile(`^\s+\..+$`)
-	arm64NameLine      = regexp.MustCompile(`^\w+:.+$`)
 	// Match labels like .LBB0_2: (Linux) or LBB0_2: (macOS)
 	arm64LabelLine = regexp.MustCompile(`^\.?\w+_\d+:.*$`)
 	arm64CodeLine  = regexp.MustCompile(`^\s+\w+.*$`)
@@ -43,8 +40,6 @@ var (
 	arm64CbzLine = regexp.MustCompile(`^(cbz|cbnz)\t(\w+),\s*\.?(\w+_\d+)$`)
 	// Match TBZ/TBNZ: "tbz w12, #0, LBB0_21" or "tbnz x5, #31, .LBB0_3"
 	arm64TbzLine = regexp.MustCompile(`^(tbz|tbnz)\t(\w+),\s*#(\d+),\s*\.?(\w+_\d+)$`)
-	arm64SymbolLine = regexp.MustCompile(`^\w+\s+<\w+>:$`)
-	arm64DataLine   = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
 	// Match stack frame allocation: "sub sp, sp, #N" with hex or decimal, optional lsl #12
 	arm64StackAllocLine = regexp.MustCompile(`^\s*sub\s+sp,\s*sp,\s*#(0x[0-9a-fA-F]+|\d+)(?:,\s*lsl\s*#(\d+))?`)
 	// Match pre-decrement stack allocation: "stp ... [sp, #-N]!" or "str ... [sp, #-N]!"
@@ -119,13 +114,6 @@ type arm64Line struct {
 	DynAllocPad int
 }
 
-// arm64ConstPool represents a constant pool entry with its label and data
-type arm64ConstPool struct {
-	Label string   // e.g., "CPI0_0" (without leading l or .)
-	Data  []uint32 // Data as 32-bit words (for .long directives)
-	Size  int      // Total size in bytes
-}
-
 // arm64ConstPoolRef tracks a constant pool reference that needs to be rewritten
 // When we see adrp+ldr pairs that reference constant pools, we need to rewrite them
 type arm64ConstPoolRef struct {
@@ -161,6 +149,7 @@ type arm64ConstPoolRef struct {
 //	Bits 14-10: Rt2
 //	Bits 9-5: Rn (base register)
 //	Bits 4-0: Rt
+//
 // parseArm64Immediate parses a hex or decimal immediate value with an optional
 // left shift. matches[1] is the immediate (e.g. "0x5a0" or "1440"), and
 // shiftStr is the shift amount (e.g. "12" from "lsl #12") or empty.
@@ -278,124 +267,105 @@ func (line *arm64Line) transformStackInstruction() (string, bool) {
 	return "", false
 }
 
-func (line *arm64Line) String() string {
-	var builder strings.Builder
+func (line *arm64Line) emitTransformed(newBinary string) string {
+	return fmt.Sprintf("\tWORD $0x%s\t// %s [transformed]\n", newBinary, line.Assembly)
+}
 
-	// Skip lines with empty Binary and Assembly (removed instructions)
+func (line *arm64Line) emitBranch() string {
+	splits := strings.Split(line.Assembly, "\t")
+	instruction := strings.Map(func(r rune) rune {
+		if r == '.' {
+			return -1
+		}
+		return unicode.ToUpper(r)
+	}, splits[0])
+	label := normalizeLabel(splits[1])
+	return fmt.Sprintf("\t%s %s\n", instruction, label)
+}
+
+func (line *arm64Line) emitCbz(m []string) string {
+	mnemonic := strings.ToUpper(m[1])
+	reg := m[2]
+	if strings.HasPrefix(reg, "w") {
+		mnemonic += "W"
+	}
+	goReg := goRegisterName(reg)
+	label := normalizeLabel(m[3])
+	return fmt.Sprintf("\t%s %s, %s\n", mnemonic, goReg, label)
+}
+
+func (line *arm64Line) emitTbz(m []string) string {
+	mnemonic := strings.ToUpper(m[1])
+	goReg := goRegisterName(m[2])
+	label := normalizeLabel(m[4])
+	return fmt.Sprintf("\t%s $%s, %s, %s\n", mnemonic, m[3], goReg, label)
+}
+
+func (line *arm64Line) emitSpOffsetAdjusted() string {
+	binary, err := strconv.ParseUint(line.Binary, 16, 32)
+	if err == nil {
+		if arm64AddFromSpLine.MatchString(line.Assembly) || arm64SubSpFromRegLine.MatchString(line.Assembly) {
+			// ADD Xd, SP, #imm or SUB SP, Xn, #imm: imm12 at bits 21:10
+			sh := (binary >> 22) & 1
+			imm12 := (binary >> 10) & 0xfff
+			shift := uint64(0)
+			if sh == 1 {
+				shift = 12
+			}
+			newImm12 := imm12 + uint64(line.SpOffset>>shift)
+			binary &^= 0xfff << 10
+			binary |= (newImm12 & 0xfff) << 10
+		} else if arm64SingleRegLine.MatchString(line.Assembly) {
+			// STR/LDR unsigned offset: imm12 at bits 21:10
+			if (binary>>24)&3 == 1 {
+				imm12 := (binary >> 10) & 0xfff
+				scale := 1 << ((binary >> 30) & 3)
+				newImm12 := imm12 + uint64(line.SpOffset)/uint64(scale)
+				binary &^= 0xfff << 10
+				binary |= (newImm12 & 0xfff) << 10
+			}
+		} else {
+			// STP/LDP signed-offset: imm7 at bits 21:15
+			scale := 8
+			if (binary>>30)&3 == 0 {
+				scale = 4
+			}
+			imm7 := (binary >> 15) & 0x7f
+			newImm7 := imm7 + uint64(line.SpOffset/scale)
+			binary &^= 0x7f << 15
+			binary |= (newImm7 & 0x7f) << 15
+		}
+	}
+	return fmt.Sprintf("\tWORD $0x%08x\t// %s [offset adjusted]\n", binary, line.Assembly)
+}
+
+func (line *arm64Line) emitDefault() string {
+	return fmt.Sprintf("\tWORD $0x%v\t// %s\n", line.Binary, line.Assembly)
+}
+
+func (line *arm64Line) String() string {
 	if line.Binary == "" && line.Assembly == "" {
 		return ""
 	}
-
-	// Check for stack frame operations that need transformation
 	if newBinary, transformed := line.transformStackInstruction(); transformed {
 		if newBinary == "" {
-			// Instruction should be removed (e.g., sub sp, sp, #N)
 			return ""
 		}
-		// Use transformed binary
-		builder.WriteString("\t")
-		builder.WriteString(fmt.Sprintf("WORD $0x%s", newBinary))
-		builder.WriteString("\t// ")
-		builder.WriteString(line.Assembly)
-		builder.WriteString(" [transformed]")
-		builder.WriteString("\n")
-		return builder.String()
+		return line.emitTransformed(newBinary)
 	}
-
 	if arm64JmpLine.MatchString(line.Assembly) {
-		splits := strings.Split(line.Assembly, "\t")
-		instruction := strings.Map(func(r rune) rune {
-			if r == '.' {
-				return -1
-			}
-			return unicode.ToUpper(r)
-		}, splits[0])
-		// Handle both Linux (.LBB0_5) and macOS (LBB0_5) label formats
-		label := splits[1]
-		label = strings.TrimPrefix(label, ".")
-		label = strings.TrimPrefix(label, "L")
-		builder.WriteString(fmt.Sprintf("%s %s\n", instruction, label))
-	} else if m := arm64CbzLine.FindStringSubmatch(line.Assembly); m != nil {
-		// CBZ/CBNZ: emit as Go mnemonic with label reference so the assembler
-		// resolves offsets correctly (raw WORD offsets break when RET expands).
-		mnemonic := strings.ToUpper(m[1]) // "CBZ" or "CBNZ"
-		reg := m[2]                       // e.g., "x10" or "w8"
-		label := m[3]                     // e.g., "LBB0_40"
-		if strings.HasPrefix(reg, "w") {
-			mnemonic += "W"
-		}
-		goReg := goRegisterName(reg)
-		label = strings.TrimPrefix(label, "L")
-		builder.WriteString(fmt.Sprintf("\t%s %s, %s\n", mnemonic, goReg, label))
-	} else if m := arm64TbzLine.FindStringSubmatch(line.Assembly); m != nil {
-		// TBZ/TBNZ: emit as Go mnemonic with bit, register, and label reference.
-		mnemonic := strings.ToUpper(m[1]) // "TBZ" or "TBNZ"
-		reg := m[2]                       // e.g., "w12" or "x5"
-		bit := m[3]                       // e.g., "0"
-		label := m[4]                     // e.g., "LBB0_21"
-		goReg := goRegisterName(reg)
-		label = strings.TrimPrefix(label, "L")
-		builder.WriteString(fmt.Sprintf("\t%s $%s, %s, %s\n", mnemonic, bit, goReg, label))
-	} else if line.SpOffset > 0 {
-		// Callee-save instruction that needs sp-relative offset adjustment.
-		// This handles signed-offset stp/ldp between the pre-decrement and sub-sp,
-		// and also "add xN, sp, #imm" frame pointer setup instructions.
-		binary, err := strconv.ParseUint(line.Binary, 16, 32)
-		if err == nil {
-			if arm64AddFromSpLine.MatchString(line.Assembly) || arm64SubSpFromRegLine.MatchString(line.Assembly) {
-				// ADD Xd, SP, #imm (frame pointer setup) or SUB SP, Xn, #imm (frame pointer restore):
-				// imm12 at bits 21:10. Same encoding layout, only bit 30 (op) differs.
-				// Encoding: sf=1 op S=0 100010 sh imm12 Rn Rd
-				// sh=0: imm12 is unshifted. sh=1: imm12 is LSL #12.
-				sh := (binary >> 22) & 1
-				imm12 := (binary >> 10) & 0xfff
-				if sh == 0 {
-					newImm12 := imm12 + uint64(line.SpOffset)
-					binary &^= 0xfff << 10
-					binary |= (newImm12 & 0xfff) << 10
-				} else {
-					// Shifted immediate: adjust by SpOffset >> 12 (only if aligned)
-					newImm12 := imm12 + uint64(line.SpOffset>>12)
-					binary &^= 0xfff << 10
-					binary |= (newImm12 & 0xfff) << 10
-				}
-			} else if arm64SingleRegLine.MatchString(line.Assembly) {
-				// STR/LDR with unsigned offset: imm12 at bits 21:10, scaled by 8 for 64-bit
-				// Bits [31:30] = size, [25:24] = 01 for unsigned offset
-				if (binary>>24)&3 == 1 { // unsigned offset form
-					imm12 := (binary >> 10) & 0xfff
-					scale := 1 << ((binary >> 30) & 3) // size field determines scale
-					newImm12 := imm12 + uint64(line.SpOffset)/uint64(scale)
-					binary &^= 0xfff << 10
-					binary |= (newImm12 & 0xfff) << 10
-				}
-			} else {
-				// STP/LDP signed-offset: imm7 at bits 21:15, scaled by 8 for 64-bit (by 4 for 32-bit)
-				// Add SpOffset/scale to existing imm7
-				scale := 8 // 64-bit registers
-				if (binary>>30)&3 == 0 {
-					scale = 4 // 32-bit registers
-				}
-				imm7 := (binary >> 15) & 0x7f
-				newImm7 := imm7 + uint64(line.SpOffset/scale)
-				binary &^= 0x7f << 15
-				binary |= (newImm7 & 0x7f) << 15
-			}
-		}
-		builder.WriteString("\t")
-		builder.WriteString(fmt.Sprintf("WORD $0x%08x", binary))
-		builder.WriteString("\t// ")
-		builder.WriteString(line.Assembly)
-		builder.WriteString(" [offset adjusted]")
-		builder.WriteString("\n")
-	} else {
-		builder.WriteString("\t")
-		builder.WriteString(fmt.Sprintf("WORD $0x%v", line.Binary))
-		builder.WriteString("\t// ")
-		builder.WriteString(line.Assembly)
-		builder.WriteString("\n")
+		return line.emitBranch()
 	}
-	return builder.String()
+	if m := arm64CbzLine.FindStringSubmatch(line.Assembly); m != nil {
+		return line.emitCbz(m)
+	}
+	if m := arm64TbzLine.FindStringSubmatch(line.Assembly); m != nil {
+		return line.emitTbz(m)
+	}
+	if line.SpOffset > 0 {
+		return line.emitSpOffsetAdjusted()
+	}
+	return line.emitDefault()
 }
 
 // Name returns the architecture name
@@ -434,13 +404,13 @@ func (p *ARM64Parser) Prologue() string {
 	// Define include guards so real system headers are skipped during parsing.
 	// The modernc.org C parser can't handle GCC/Clang builtins in these headers.
 	// All NEON/SVE types are provided as typedefs below instead.
-	prologue.WriteString("#define _AARCH64_NEON_H_\n")   // GCC arm_neon.h
-	prologue.WriteString("#define __ARM_NEON_H 1\n")     // Clang arm_neon.h
-	prologue.WriteString("#define _ARM_NEON_H_ 1\n")     // alternative arm_neon.h
-	prologue.WriteString("#define _AARCH64_SVE_H_\n")    // GCC arm_sve.h
-	prologue.WriteString("#define __ARM_SVE_H 1\n")      // Clang arm_sve.h
-	prologue.WriteString("#define _ARM_FP16_H_ 1\n")     // arm_fp16.h
-	prologue.WriteString("#define _ARM_BF16_H_ 1\n")     // arm_bf16.h
+	prologue.WriteString("#define _AARCH64_NEON_H_\n") // GCC arm_neon.h
+	prologue.WriteString("#define __ARM_NEON_H 1\n")   // Clang arm_neon.h
+	prologue.WriteString("#define _ARM_NEON_H_ 1\n")   // alternative arm_neon.h
+	prologue.WriteString("#define _AARCH64_SVE_H_\n")  // GCC arm_sve.h
+	prologue.WriteString("#define __ARM_SVE_H 1\n")    // Clang arm_sve.h
+	prologue.WriteString("#define _ARM_FP16_H_ 1\n")   // arm_fp16.h
+	prologue.WriteString("#define _ARM_BF16_H_ 1\n")   // arm_bf16.h
 
 	// Define __bf16 for arm_bf16.h (compiler built-in type)
 	prologue.WriteString("typedef short __bf16;\n")
@@ -566,17 +536,12 @@ func (p *ARM64Parser) TranslateAssembly(t *TranslateUnit, functions []Function) 
 	return p.generateGoAssembly(t, functions, assembly, constPools)
 }
 
-func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]*arm64Line, map[string]int, map[string]int, map[string]bool, map[string]bool, map[string]*arm64ConstPool, error) {
-	file, err := os.Open(path)
+func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]*arm64Line, map[string]int, map[string]int, map[string]bool, map[string]bool, map[string]*ConstPool, error) {
+	scanner, cleanup, err := openAssemblyFile(path)
 	if err != nil {
 		return nil, nil, nil, nil, nil, nil, err
 	}
-	defer func(file *os.File) {
-		if err = file.Close(); err != nil {
-			_, _ = fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-	}(file)
+	defer cleanup()
 
 	var (
 		stackSizes     = make(map[string]int)
@@ -585,17 +550,12 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 		hasDynRegAlloc = make(map[string]bool)        // functions with register-based dynamic SP adjustment (VLAs)
 		rdsvlRegs      = make(map[string]map[int]int) // funcName -> {regNum: multiplier} from rdsvl
 		functions      = make(map[string][]*arm64Line)
-		constPools     = make(map[string]*arm64ConstPool)
+		cpa            = NewConstPoolAccumulator()
 		functionName   string
 		labelName      string
 		// Constant pool parsing state
-		inLiteralSection  bool
-		currentConstPool  *arm64ConstPool
-		currentConstLabel string
-		byteAccum         uint32 // accumulates .byte values into 32-bit words (little-endian)
-		byteCount         int    // number of bytes accumulated (0-3)
+		inLiteralSection bool
 	)
-	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
 
@@ -607,77 +567,22 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 
 		// Check for constant pool label (lCPI0_0: or .LCPI0_0:)
 		if arm64ConstPoolLabel.MatchString(line) {
-			// Flush partial byte accumulation and save previous constant pool
-			if currentConstPool != nil {
-				if byteCount > 0 {
-					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-					currentConstPool.Size += 4
-					byteAccum = 0
-					byteCount = 0
-				}
-				if len(currentConstPool.Data) > 0 {
-					constPools[currentConstLabel] = currentConstPool
-				}
-			}
-			// Start new constant pool
-			labelPart := strings.Split(line, ":")[0]
-			// Normalize label: strip leading . and l
-			labelPart = strings.TrimPrefix(labelPart, ".")
-			labelPart = strings.TrimPrefix(labelPart, "l")
-			currentConstLabel = labelPart
-			currentConstPool = &arm64ConstPool{
-				Label: labelPart,
-				Data:  make([]uint32, 0),
-			}
+			cpa.StartPool(normalizeLabel(strings.Split(line, ":")[0]))
 			continue
 		}
 
 		// Parse .long/.quad/.byte directives for constant pool data
-		if inLiteralSection || currentConstPool != nil {
+		if inLiteralSection || cpa.Active() {
 			if matches := arm64LongDirective.FindStringSubmatch(line); matches != nil {
-				if currentConstPool != nil {
-					// Flush any partial byte accumulation
-					if byteCount > 0 {
-						currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-						currentConstPool.Size += 4
-						byteAccum = 0
-						byteCount = 0
-					}
-					val := parseIntValue(matches[1])
-					currentConstPool.Data = append(currentConstPool.Data, uint32(val))
-					currentConstPool.Size += 4
-				}
+				cpa.AddLong(parseIntValue(matches[1]))
 				continue
 			}
 			if matches := arm64QuadDirective.FindStringSubmatch(line); matches != nil {
-				if currentConstPool != nil {
-					// Flush any partial byte accumulation
-					if byteCount > 0 {
-						currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-						currentConstPool.Size += 4
-						byteAccum = 0
-						byteCount = 0
-					}
-					val := parseIntValue(matches[1])
-					// Store quad as two 32-bit words (little-endian)
-					currentConstPool.Data = append(currentConstPool.Data, uint32(val), uint32(val>>32))
-					currentConstPool.Size += 8
-				}
+				cpa.AddQuad(parseIntValue(matches[1]))
 				continue
 			}
 			if matches := arm64ByteDirective.FindStringSubmatch(line); matches != nil {
-				if currentConstPool != nil {
-					val := parseIntValue(matches[1])
-					// Accumulate bytes into 32-bit words (little-endian)
-					byteAccum |= uint32(val&0xFF) << (byteCount * 8)
-					byteCount++
-					if byteCount == 4 {
-						currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-						currentConstPool.Size += 4
-						byteAccum = 0
-						byteCount = 0
-					}
-				}
+				cpa.AccumulateByte(parseIntValue(matches[1]))
 				continue
 			}
 		}
@@ -685,38 +590,22 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 		// Check for section change that exits literal section
 		if strings.HasPrefix(strings.TrimSpace(line), ".section") && !arm64LiteralSection.MatchString(line) {
 			inLiteralSection = false
-			// Flush partial byte accumulation and save current constant pool
-			if currentConstPool != nil {
-				if byteCount > 0 {
-					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-					currentConstPool.Size += 4
-					byteAccum = 0
-					byteCount = 0
-				}
-				if len(currentConstPool.Data) > 0 {
-					constPools[currentConstLabel] = currentConstPool
-				}
-				currentConstPool = nil
-				currentConstLabel = ""
-			}
+			cpa.FinishPool()
 		}
 
-		if arm64AttributeLine.MatchString(line) {
+		if attributeLine.MatchString(line) {
 			continue
 		} else if arm64LabelLine.MatchString(line) {
 			// Check labels BEFORE function names because labels like "LBB0_2: ; comment"
 			// can match the function name pattern due to content after the colon
-			labelName = strings.Split(line, ":")[0]
-			// Strip leading dot and L prefix (Linux uses .LBB0_2, macOS uses LBB0_2)
-			labelName = strings.TrimPrefix(labelName, ".")
-			labelName = strings.TrimPrefix(labelName, "L")
+			labelName = normalizeLabel(strings.Split(line, ":")[0])
 			lines := functions[functionName]
 			if len(lines) == 0 || lines[len(lines)-1].Assembly != "" {
 				functions[functionName] = append(functions[functionName], &arm64Line{Labels: []string{labelName}})
 			} else {
 				lines[len(lines)-1].Labels = append(lines[len(lines)-1].Labels, labelName)
 			}
-		} else if arm64NameLine.MatchString(line) {
+		} else if nameLine.MatchString(line) {
 			functionName = strings.Split(line, ":")[0]
 			// On macOS, function names are prefixed with underscore - strip it
 			if targetOS == "darwin" && strings.HasPrefix(functionName, "_") {
@@ -791,15 +680,8 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 	}
 
 	// Save any remaining constant pool
-	if currentConstPool != nil {
-		if byteCount > 0 {
-			currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-			currentConstPool.Size += 4
-		}
-		if len(currentConstPool.Data) > 0 {
-			constPools[currentConstLabel] = currentConstPool
-		}
-	}
+	cpa.FinishPool()
+	constPools := cpa.Pools()
 
 	if err = scanner.Err(); err != nil {
 		return nil, nil, nil, nil, nil, nil, err
@@ -937,17 +819,6 @@ func (p *ARM64Parser) parseAssembly(path string, targetOS string) (map[string][]
 	return functions, stackSizes, preDecSizes, hasDynSVLAlloc, hasDynRegAlloc, constPools, nil
 }
 
-// parseIntValue parses a decimal or hex integer value from a string
-func parseIntValue(s string) uint64 {
-	s = strings.TrimSpace(s)
-	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
-		val, _ := strconv.ParseUint(s[2:], 16, 64)
-		return val
-	}
-	val, _ := strconv.ParseUint(s, 10, 64)
-	return val
-}
-
 // goRegisterName converts ARM64 register names to Go assembly register names
 // x0-x30 -> R0-R30, w0-w30 -> R0-R30, q0-q31 -> V0-V31, d0-d31 -> V0-V31, s0-s31 -> F0-F31
 func goRegisterName(armReg string) string {
@@ -973,59 +844,31 @@ func (p *ARM64Parser) parseObjectDump(dump string, functions map[string][]*arm64
 	)
 	for i, line := range strings.Split(dump, "\n") {
 		line = strings.TrimSpace(line)
-		if arm64SymbolLine.MatchString(line) {
-			functionName = strings.Split(line, "<")[1]
-			functionName = strings.Split(functionName, ">")[0]
-			// On macOS, function names are prefixed with underscore - strip it
-			if targetOS == "darwin" && strings.HasPrefix(functionName, "_") {
-				functionName = functionName[1:]
-			}
+		if symbolLine.MatchString(line) {
+			functionName = extractObjDumpFunctionName(line, targetOS)
 			lineNumber = 0
-		} else if arm64DataLine.MatchString(line) {
-			data := strings.Split(line, ":")[1]
-			data = strings.TrimSpace(data)
-			splits := strings.Split(data, " ")
-			var (
-				binary   string
-				assembly string
-			)
-			for i, s := range splits {
-				if s == "" || unicode.IsSpace(rune(s[0])) {
-					assembly = strings.Join(splits[i:], " ")
-					assembly = strings.TrimSpace(assembly)
-					break
-				}
-				binary = s
+		} else if dataLine.MatchString(line) {
+			binaryTokens, _ := parseObjDumpDataLine(line)
+			if len(binaryTokens) == 0 {
+				continue
 			}
 			if lineNumber >= len(functions[functionName]) {
 				return fmt.Errorf("%d: unexpected objectdump line: %s", i, line)
 			}
-			functions[functionName][lineNumber].Binary = binary
+			// ARM64 uses fixed-width 32-bit encoding — last token is the full binary
+			functions[functionName][lineNumber].Binary = binaryTokens[len(binaryTokens)-1]
 			lineNumber++
 		}
 	}
 	return nil
 }
 
-func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function, assembly map[string][]*arm64Line, constPools map[string]*arm64ConstPool) error {
+func (p *ARM64Parser) generateGoAssembly(t *TranslateUnit, functions []Function, assembly map[string][]*arm64Line, constPools map[string]*ConstPool) error {
 	var builder strings.Builder
 	builder.WriteString(p.BuildTags())
 	t.writeHeader(&builder)
 
-	// Emit DATA/GLOBL directives for constant pools
-	if len(constPools) > 0 {
-		builder.WriteString("\n#include \"textflag.h\"\n")
-		builder.WriteString("\n// Constant pool data\n")
-		for label, pool := range constPools {
-			// Emit DATA directive with little-endian byte order
-			// Format: DATA symbol<>+offset(SB)/size, $value
-			for i, val := range pool.Data {
-				builder.WriteString(fmt.Sprintf("DATA %s<>+%d(SB)/4, $0x%08x\n", label, i*4, val))
-			}
-			// Emit GLOBL directive to define the symbol size
-			builder.WriteString(fmt.Sprintf("GLOBL %s<>(SB), (RODATA|NOPTR), $%d\n", label, pool.Size))
-		}
-	}
+	emitConstPools(&builder, constPools)
 
 	for _, function := range functions {
 		// Calculate return size based on type

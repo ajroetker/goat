@@ -19,8 +19,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
+	"unicode"
 	"sort"
 	"strings"
 
@@ -29,13 +29,13 @@ import (
 )
 
 var supportedTypes = map[string]int{
-	"int32_t":    4,
-	"int64_t":    8,
-	"long":       8,
-	"float":      4,
-	"double":     8,
-	"_Bool":      1,
-	"float16_t":  2,
+	"int32_t":   4,
+	"int64_t":   8,
+	"long":      8,
+	"float":     4,
+	"double":    8,
+	"_Bool":     1,
+	"float16_t": 2,
 }
 
 type TranslateUnit struct {
@@ -46,8 +46,8 @@ type TranslateUnit struct {
 	Go           string
 	Package      string
 	Options      []string
-	IncludePaths []string   // Additional include paths for C parser
-	Sysroot      string     // Explicit sysroot path for cross-compilation
+	IncludePaths []string // Additional include paths for C parser
+	Sysroot      string   // Explicit sysroot path for cross-compilation
 	Offset       int
 	Target       string     // Target architecture (amd64, arm64, etc.)
 	TargetOS     string     // Target OS (darwin, linux, etc.)
@@ -539,11 +539,7 @@ func runCommand(name string, arg ...string) (string, error) {
 	cmd := exec.Command(name, arg...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		if output != nil {
-			return "", errors.New(string(output))
-		} else {
-			return "", err
-		}
+		return "", errors.New(string(output))
 	}
 	return string(output), nil
 }
@@ -555,12 +551,12 @@ func fetchVersion(command string) string {
 		os.Exit(1)
 	}
 	version = strings.Split(version, "\n")[0]
-	loc := regexp.MustCompile(`\d`).FindStringIndex(version)
-	if loc == nil {
+	idx := strings.IndexFunc(version, unicode.IsDigit)
+	if idx < 0 {
 		_, _ = fmt.Fprintln(os.Stderr, "failed to fetch version")
 		os.Exit(1)
 	}
-	return version[loc[0]:]
+	return version[idx:]
 }
 
 func hasPointer(functions []Function) bool {

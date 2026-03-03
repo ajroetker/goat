@@ -197,7 +197,7 @@ func TestARM64ParseAssemblyByteDirective(t *testing.T) {
 			}
 			actual := make(map[string]wantPool)
 			for label, pool := range constPools {
-				actual[label] = wantPool{data: pool.Data, size: pool.Size}
+				actual[label] = wantPool{data: pool.Data, size: len(pool.Data) * 4}
 			}
 			checkConstPools(t, actual, tt.wantPools)
 		})
@@ -342,7 +342,7 @@ func TestAMD64ParseAssemblyByteDirective(t *testing.T) {
 			}
 			actual := make(map[string]wantPool)
 			for label, pool := range constPools {
-				actual[label] = wantPool{data: pool.Data, size: pool.Size}
+				actual[label] = wantPool{data: pool.Data, size: len(pool.Data) * 4}
 			}
 			checkConstPools(t, actual, tt.wantPools)
 		})
@@ -470,7 +470,7 @@ func TestLoong64ParseAssemblyByteDirective(t *testing.T) {
 			}
 			actual := make(map[string]wantPool)
 			for label, pool := range constPools {
-				actual[label] = wantPool{data: pool.Data, size: pool.Size}
+				actual[label] = wantPool{data: pool.Data, size: len(pool.Data) * 4}
 			}
 			checkConstPools(t, actual, tt.wantPools)
 		})
@@ -615,7 +615,7 @@ func TestRISCV64ParseAssemblyByteDirective(t *testing.T) {
 			}
 			actual := make(map[string]wantPool)
 			for label, pool := range constPools {
-				actual[label] = wantPool{data: pool.Data, size: pool.Size}
+				actual[label] = wantPool{data: pool.Data, size: len(pool.Data) * 4}
 			}
 			checkConstPools(t, actual, tt.wantPools)
 		})

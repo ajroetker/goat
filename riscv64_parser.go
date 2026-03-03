@@ -15,13 +15,10 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
-	"unicode"
 
 	"github.com/klauspost/asmfmt"
 	"github.com/samber/lo"
@@ -32,12 +29,8 @@ type RISCV64Parser struct{}
 
 // riscv64 regex patterns
 var (
-	riscv64AttributeLine = regexp.MustCompile(`^\s+\..+$`)
-	riscv64NameLine      = regexp.MustCompile(`^\w+:.+$`)
-	riscv64LabelLine     = regexp.MustCompile(`^\.\w+_\d+:.*$`)
-	riscv64CodeLine      = regexp.MustCompile(`^\s+\w+.+$`)
-	riscv64SymbolLine    = regexp.MustCompile(`^\w+\s+<\w+>:$`)
-	riscv64DataLine      = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
+	riscv64LabelLine = regexp.MustCompile(`^\.\w+_\d+:.*$`)
+	riscv64CodeLine  = regexp.MustCompile(`^\s+\w+.+$`)
 
 	// Constant pool patterns
 	// Match constant pool labels: .LCPI0_0:
@@ -68,13 +61,6 @@ type riscv64Line struct {
 	Labels   []string
 	Assembly string
 	Binary   string
-}
-
-// riscv64ConstPool represents a constant pool entry with its label and data
-type riscv64ConstPool struct {
-	Label string   // e.g., "CPI0_0" (without leading .L)
-	Data  []uint32 // Data as 32-bit words (for .word directives)
-	Size  int      // Total size in bytes
 }
 
 func (line *riscv64Line) String() string {
@@ -128,8 +114,8 @@ func (p *RISCV64Parser) Prologue() string {
 	var prologue strings.Builder
 	// Define include guards so real system intrinsic headers are skipped.
 	prologue.WriteString("#define GOAT_PARSER 1\n")
-	prologue.WriteString("#define _RISCV_VECTOR_H 1\n")     // riscv_vector.h
-	prologue.WriteString("#define __RISCV_VECTOR_H 1\n")     // alternative guard
+	prologue.WriteString("#define _RISCV_VECTOR_H 1\n")  // riscv_vector.h
+	prologue.WriteString("#define __RISCV_VECTOR_H 1\n") // alternative guard
 	return prologue.String()
 }
 
@@ -163,32 +149,21 @@ func (p *RISCV64Parser) TranslateAssembly(t *TranslateUnit, functions []Function
 	return p.generateGoAssembly(t, functions, assembly, constPools)
 }
 
-func (p *RISCV64Parser) parseAssembly(path string) (map[string][]*riscv64Line, map[string]int, map[string]*riscv64ConstPool, error) {
-	file, err := os.Open(path)
+func (p *RISCV64Parser) parseAssembly(path string) (map[string][]*riscv64Line, map[string]int, map[string]*ConstPool, error) {
+	scanner, cleanup, err := openAssemblyFile(path)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	defer func(file *os.File) {
-		if err = file.Close(); err != nil {
-			_, _ = fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-	}(file)
+	defer cleanup()
 
 	var (
 		stackSizes   = make(map[string]int)
-		functions    = make(map[string][]*riscv64Line)
-		constPools   = make(map[string]*riscv64ConstPool)
-		functionName string
-		labelName    string
-		// Constant pool parsing state
-		inRodataSection   bool
-		currentConstPool  *riscv64ConstPool
-		currentConstLabel string
-		byteAccum         uint32 // accumulates .byte values into 32-bit words (little-endian)
-		byteCount         int    // number of bytes accumulated (0-3)
+		functions       = make(map[string][]*riscv64Line)
+		cpa             = NewConstPoolAccumulator()
+		functionName    string
+		labelName       string
+		inRodataSection bool
 	)
-	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
 
@@ -200,76 +175,23 @@ func (p *RISCV64Parser) parseAssembly(path string) (map[string][]*riscv64Line, m
 
 		// Check for constant pool label (.LCPI0_0:)
 		if riscv64ConstPoolLabel.MatchString(line) {
-			// Flush partial byte accumulation and save previous constant pool
-			if currentConstPool != nil {
-				if byteCount > 0 {
-					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-					currentConstPool.Size += 4
-					byteAccum = 0
-					byteCount = 0
-				}
-				if len(currentConstPool.Data) > 0 {
-					constPools[currentConstLabel] = currentConstPool
-				}
-			}
-			// Start new constant pool
-			labelPart := strings.Split(line, ":")[0]
-			// Normalize label: strip leading .L to get CPI0_0
-			labelPart = strings.TrimPrefix(labelPart, ".L")
-			currentConstLabel = labelPart
-			currentConstPool = &riscv64ConstPool{
-				Label: labelPart,
-				Data:  make([]uint32, 0),
-			}
+			labelPart := strings.TrimPrefix(strings.Split(line, ":")[0], ".L")
+			cpa.StartPool(labelPart)
 			continue
 		}
 
 		// Parse .word/.dword/.byte directives for constant pool data
-		if inRodataSection || currentConstPool != nil {
+		if inRodataSection || cpa.Active() {
 			if matches := riscv64WordDirective.FindStringSubmatch(line); matches != nil {
-				if currentConstPool != nil {
-					// Flush any partial byte accumulation
-					if byteCount > 0 {
-						currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-						currentConstPool.Size += 4
-						byteAccum = 0
-						byteCount = 0
-					}
-					val := riscv64ParseIntValue(matches[1])
-					currentConstPool.Data = append(currentConstPool.Data, uint32(val))
-					currentConstPool.Size += 4
-				}
+				cpa.AddLong(parseIntValue(matches[1]))
 				continue
 			}
 			if matches := riscv64DwordDirective.FindStringSubmatch(line); matches != nil {
-				if currentConstPool != nil {
-					// Flush any partial byte accumulation
-					if byteCount > 0 {
-						currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-						currentConstPool.Size += 4
-						byteAccum = 0
-						byteCount = 0
-					}
-					val := riscv64ParseIntValue(matches[1])
-					// Store dword as two 32-bit words (little-endian)
-					currentConstPool.Data = append(currentConstPool.Data, uint32(val), uint32(val>>32))
-					currentConstPool.Size += 8
-				}
+				cpa.AddQuad(parseIntValue(matches[1]))
 				continue
 			}
 			if matches := riscv64ByteDirective.FindStringSubmatch(line); matches != nil {
-				if currentConstPool != nil {
-					val := riscv64ParseIntValue(matches[1])
-					// Accumulate bytes into 32-bit words (little-endian)
-					byteAccum |= uint32(val&0xFF) << (byteCount * 8)
-					byteCount++
-					if byteCount == 4 {
-						currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-						currentConstPool.Size += 4
-						byteAccum = 0
-						byteCount = 0
-					}
-				}
+				cpa.AccumulateByte(parseIntValue(matches[1]))
 				continue
 			}
 		}
@@ -277,43 +199,18 @@ func (p *RISCV64Parser) parseAssembly(path string) (map[string][]*riscv64Line, m
 		// Check for section change that exits rodata section
 		if strings.HasPrefix(strings.TrimSpace(line), ".section") && !riscv64RodataSection.MatchString(line) {
 			inRodataSection = false
-			// Flush partial byte accumulation and save current constant pool
-			if currentConstPool != nil {
-				if byteCount > 0 {
-					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-					currentConstPool.Size += 4
-					byteAccum = 0
-					byteCount = 0
-				}
-				if len(currentConstPool.Data) > 0 {
-					constPools[currentConstLabel] = currentConstPool
-				}
-				currentConstPool = nil
-				currentConstLabel = ""
-			}
+			cpa.FinishPool()
 		}
 
 		// Check for .text section which also exits rodata
 		if strings.HasPrefix(strings.TrimSpace(line), ".text") {
 			inRodataSection = false
-			if currentConstPool != nil {
-				if byteCount > 0 {
-					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-					currentConstPool.Size += 4
-					byteAccum = 0
-					byteCount = 0
-				}
-				if len(currentConstPool.Data) > 0 {
-					constPools[currentConstLabel] = currentConstPool
-				}
-				currentConstPool = nil
-				currentConstLabel = ""
-			}
+			cpa.FinishPool()
 		}
 
-		if riscv64AttributeLine.MatchString(line) {
+		if attributeLine.MatchString(line) {
 			continue
-		} else if riscv64NameLine.MatchString(line) {
+		} else if nameLine.MatchString(line) {
 			functionName = strings.Split(line, ":")[0]
 			functions[functionName] = make([]*riscv64Line, 0)
 			labelName = ""
@@ -342,31 +239,13 @@ func (p *RISCV64Parser) parseAssembly(path string) (map[string][]*riscv64Line, m
 	}
 
 	// Save any remaining constant pool
-	if currentConstPool != nil {
-		if byteCount > 0 {
-			currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-			currentConstPool.Size += 4
-		}
-		if len(currentConstPool.Data) > 0 {
-			constPools[currentConstLabel] = currentConstPool
-		}
-	}
+	cpa.FinishPool()
+	constPools := cpa.Pools()
 
 	if err = scanner.Err(); err != nil {
 		return nil, nil, nil, err
 	}
 	return functions, stackSizes, constPools, nil
-}
-
-// riscv64ParseIntValue parses a decimal or hex integer value from a string
-func riscv64ParseIntValue(s string) uint64 {
-	s = strings.TrimSpace(s)
-	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
-		val, _ := strconv.ParseUint(s[2:], 16, 64)
-		return val
-	}
-	val, _ := strconv.ParseUint(s, 10, 64)
-	return val
 }
 
 // riscv64GoRegisterName converts RISC-V register names to Go assembly register names
@@ -441,56 +320,31 @@ func (p *RISCV64Parser) parseObjectDump(dump string, functions map[string][]*ris
 	)
 	for i, line := range strings.Split(dump, "\n") {
 		line = strings.TrimSpace(line)
-		if riscv64SymbolLine.MatchString(line) {
-			functionName = strings.Split(line, "<")[1]
-			functionName = strings.Split(functionName, ">")[0]
+		if symbolLine.MatchString(line) {
+			functionName = extractObjDumpFunctionName(line, "")
 			lineNumber = 0
-		} else if riscv64DataLine.MatchString(line) {
-			data := strings.Split(line, ":")[1]
-			data = strings.TrimSpace(data)
-			splits := strings.Split(data, " ")
-			var (
-				binary   string
-				assembly string
-			)
-			for i, s := range splits {
-				if s == "" || unicode.IsSpace(rune(s[0])) {
-					assembly = strings.Join(splits[i:], " ")
-					assembly = strings.TrimSpace(assembly)
-					break
-				}
-				binary = s
+		} else if dataLine.MatchString(line) {
+			binaryTokens, _ := parseObjDumpDataLine(line)
+			if len(binaryTokens) == 0 {
+				continue
 			}
 			if lineNumber >= len(functions[functionName]) {
 				return fmt.Errorf("%d: unexpected objectdump line: %s", i, line)
 			}
-			functions[functionName][lineNumber].Binary = binary
+			functions[functionName][lineNumber].Binary = binaryTokens[len(binaryTokens)-1]
 			lineNumber++
 		}
 	}
 	return nil
 }
 
-func (p *RISCV64Parser) generateGoAssembly(t *TranslateUnit, functions []Function, assembly map[string][]*riscv64Line, constPools map[string]*riscv64ConstPool) error {
+func (p *RISCV64Parser) generateGoAssembly(t *TranslateUnit, functions []Function, assembly map[string][]*riscv64Line, constPools map[string]*ConstPool) error {
 	// generate code
 	var builder strings.Builder
 	builder.WriteString(p.BuildTags())
 	t.writeHeader(&builder)
 
-	// Emit DATA/GLOBL directives for constant pools
-	if len(constPools) > 0 {
-		builder.WriteString("\n#include \"textflag.h\"\n")
-		builder.WriteString("\n// Constant pool data\n")
-		for label, pool := range constPools {
-			// Emit DATA directive with little-endian byte order
-			// Format: DATA symbol<>+offset(SB)/size, $value
-			for i, val := range pool.Data {
-				builder.WriteString(fmt.Sprintf("DATA %s<>+%d(SB)/4, $0x%08x\n", label, i*4, val))
-			}
-			// Emit GLOBL directive to define the symbol size
-			builder.WriteString(fmt.Sprintf("GLOBL %s<>(SB), (RODATA|NOPTR), $%d\n", label, pool.Size))
-		}
-	}
+	emitConstPools(&builder, constPools)
 
 	for _, function := range functions {
 		// Calculate return size based on type

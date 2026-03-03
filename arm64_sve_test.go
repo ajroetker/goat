@@ -131,10 +131,10 @@ func TestUsesSVEorSME(t *testing.T) {
 
 func TestTransformForbiddenInstructions(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    []*arm64Line
-		wantAsm  []string
-		wantBin  []string
+		name    string
+		input   []*arm64Line
+		wantAsm []string
+		wantBin []string
 	}{
 		{
 			name: "movi d0 #0 -> fmov s0 wzr",
@@ -267,14 +267,6 @@ func TestEnsureSmstopBeforeRet(t *testing.T) {
 		input   []*arm64Line
 		wantAsm []string
 	}{
-		{
-			name: "no smstart - unchanged",
-			input: []*arm64Line{
-				{Assembly: "mov\tx0, x1"},
-				{Assembly: "ret"},
-			},
-			wantAsm: []string{"mov\tx0, x1", "ret"},
-		},
 		{
 			name: "smstart present - smstop inserted before ret",
 			input: []*arm64Line{
@@ -620,7 +612,9 @@ func TestInjectStreamingModeConservative(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := injectStreamingModeConservative(tt.input, tt.firstSVE)
+			ctx := analyzeSVEContext(tt.input)
+			ctx.FirstSVE = tt.firstSVE
+			result := injectStreamingModeConservative(tt.input, ctx)
 			gotAsm := make([]string, len(result))
 			for i, line := range result {
 				gotAsm[i] = line.Assembly

@@ -280,80 +280,88 @@ func fixMOVAEncoding(lines []*arm64Line) []*arm64Line {
 	return result
 }
 
-// injectStreamingMode wraps SVE/SME code sections with smstart/smstop.
-// It moves SVE setup instructions (ptrue, cnt*) inside the streaming section.
-//
-// NOTE: This is a conservative implementation that only injects streaming mode
-// for functions with simple control flow. Functions with complex control flow
-// (multiple code paths, loops with early exits) may need manual adjustment.
-func injectStreamingMode(lines []*arm64Line) []*arm64Line {
-	// First, check if smstart is already present (compiler-generated)
-	hasSmstart := false
-	for _, line := range lines {
-		if line.Assembly != "" && strings.Contains(line.Assembly, "smstart") {
-			hasSmstart = true
-			break
-		}
+// SVEContext holds pre-computed analysis results for streaming mode injection.
+// A single pass over the instruction list populates all fields, avoiding
+// redundant scans in the dispatch paths.
+type SVEContext struct {
+	FirstSVE           int            // Index of first SVE/SME instruction (-1 if none)
+	HasSmstart         bool           // Compiler already generated smstart
+	HasBranchBeforeSVE bool           // Branch instructions exist before first SVE
+	HasLabelsBeforeSVE bool           // Labels exist before first SVE (skip entry point)
+	LabelToLine        map[string]int // Label name → line index mapping
+}
+
+// analyzeSVEContext performs a single pass over the instruction list to
+// compute all the information needed for streaming mode injection.
+func analyzeSVEContext(lines []*arm64Line) SVEContext {
+	ctx := SVEContext{
+		FirstSVE:    -1,
+		LabelToLine: make(map[string]int),
 	}
 
-	if hasSmstart {
-		// Compiler already generated smstart - don't inject another one
-		// Just ensure smstop is present before all ret instructions
-		return ensureSmstopBeforeRet(lines)
-	}
-
-	// Find first SVE/SME instruction (including setup like ptrue, cnt)
-	// On macOS, ALL SVE instructions must be inside streaming mode
-	firstSVE := -1
 	for i, line := range lines {
+		for _, label := range line.Labels {
+			ctx.LabelToLine[label] = i
+		}
+
 		if line.Assembly == "" {
+			if ctx.FirstSVE < 0 && i > 0 && len(line.Labels) > 0 {
+				ctx.HasLabelsBeforeSVE = true
+			}
 			continue
 		}
-		// Check for any SVE/SME instruction including setup and prologue
-		if isSVEInstruction(line.Assembly) {
-			firstSVE = i
-			break
+
+		if strings.Contains(line.Assembly, "smstart") {
+			ctx.HasSmstart = true
 		}
-	}
 
-	if firstSVE < 0 {
-		return lines // No SVE/SME instructions found
-	}
-
-	// Check for branches before firstSVE - indicates complex control flow
-	// In this case, we can't safely inject streaming mode automatically
-	hasBranchBeforeSVE := false
-	for i := 0; i < firstSVE; i++ {
-		if lines[i].Assembly != "" {
-			if sveBranchDetect.MatchString(lines[i].Assembly) {
-				hasBranchBeforeSVE = true
-				break
+		if ctx.FirstSVE < 0 {
+			if isSVEInstruction(line.Assembly) {
+				ctx.FirstSVE = i
+			} else {
+				if sveBranchDetect.MatchString(line.Assembly) {
+					ctx.HasBranchBeforeSVE = true
+				}
+				if i > 0 && len(line.Labels) > 0 {
+					ctx.HasLabelsBeforeSVE = true
+				}
 			}
 		}
 	}
 
-	// Also check for labels after the entry point - indicates branch targets
-	hasLabelsBeforeSVE := false
-	for i := 1; i < firstSVE; i++ { // Skip i=0 (function entry)
-		if len(lines[i].Labels) > 0 {
-			hasLabelsBeforeSVE = true
-			break
-		}
+	return ctx
+}
+
+// injectStreamingMode wraps SVE/SME code sections with smstart/smstop.
+// It analyzes the function's control flow in a single pass, then dispatches
+// to the appropriate injection strategy.
+func injectStreamingMode(lines []*arm64Line) []*arm64Line {
+	ctx := analyzeSVEContext(lines)
+
+	if ctx.HasSmstart {
+		return ensureSmstopBeforeRet(lines)
 	}
 
-	if hasBranchBeforeSVE || hasLabelsBeforeSVE {
-		// Complex control flow detected - add smstart just before first SVE
-		// and smstop before all ret instructions. This is less optimal but safer.
-		return injectStreamingModeConservative(lines, firstSVE)
+	if ctx.FirstSVE < 0 {
+		return lines
 	}
 
-	// Simple control flow - we can optimize by moving setup inside streaming mode
+	if ctx.HasBranchBeforeSVE || ctx.HasLabelsBeforeSVE {
+		return injectStreamingModeConservative(lines, ctx)
+	}
 
+	return injectStreamingModeSimple(lines, ctx.FirstSVE)
+}
+
+// injectStreamingModeSimple handles functions with simple control flow
+// (no branches or labels before the first SVE instruction).
+// It moves SVE setup instructions (ptrue, cnt*) inside the streaming section.
+func injectStreamingModeSimple(lines []*arm64Line, firstSVE int) []*arm64Line {
 	// Separate instructions before firstSVE into:
 	// - setupLines: ptrue, cnt* (must be inside streaming mode)
 	// - preambleLines: everything else (must be before streaming mode)
 	var setupLines, preambleLines []*arm64Line
-	for i := 0; i < firstSVE; i++ {
+	for i := range firstSVE {
 		if lines[i].Assembly == "" {
 			// Labels belong with their next instruction
 			if len(lines[i].Labels) > 0 {
@@ -371,32 +379,22 @@ func injectStreamingMode(lines []*arm64Line) []*arm64Line {
 
 		if svePtrue.MatchString(lines[i].Assembly) ||
 			sveCnt.MatchString(lines[i].Assembly) {
-			// SVE setup - must be inside streaming mode
 			setupLines = append(setupLines, lines[i])
 		} else {
-			// Non-SVE code - keep outside streaming mode
 			preambleLines = append(preambleLines, lines[i])
 		}
 	}
 
 	// Build result: preamble → smstart → setup → body → smstop → ret
 	result := make([]*arm64Line, 0, len(lines)+2+len(setupLines))
-
-	// Add preamble (non-SVE code)
 	result = append(result, preambleLines...)
-
-	// Add smstart sm (enter streaming mode)
 	result = append(result, &arm64Line{
 		Assembly: "smstart\tsm",
 		Binary:   "d503477f",
 	})
-
-	// Add setup lines (ptrue, cnt*) inside streaming mode
 	result = append(result, setupLines...)
 
-	// Add body (from firstSVE to end)
 	for i := firstSVE; i < len(lines); i++ {
-		// Insert smstop before ret
 		if lines[i].Assembly == "ret" {
 			result = append(result, &arm64Line{
 				Assembly: "smstop\tsm",
@@ -423,26 +421,17 @@ func injectStreamingMode(lines []*arm64Line) []*arm64Line {
 // from already-streaming code.
 //
 // Note: smstop when not in streaming mode is harmless (no-op)
-func injectStreamingModeConservative(lines []*arm64Line, firstSVE int) []*arm64Line {
-	// Build label -> line index mapping
-	labelToLine := make(map[string]int)
-	for i, line := range lines {
-		for _, label := range line.Labels {
-			labelToLine[label] = i
-		}
-	}
-
+func injectStreamingModeConservative(lines []*arm64Line, ctx SVEContext) []*arm64Line {
 	// Find branch targets from BEFORE firstSVE
 	// These are the blocks that can bypass the main streaming entry
 	branchTargetsBeforeFirstSVE := make(map[int]bool)
-	for i := range firstSVE {
+	for i := range ctx.FirstSVE {
 		if matches := sveBranchTarget.FindStringSubmatch(lines[i].Assembly); len(matches) > 1 {
 			targetLabel := matches[1]
-			// Handle L prefix: clang generates LBB1_8 but GOAT stores BB1_8
-			lookupLabel := strings.TrimPrefix(targetLabel, "L")
-			if targetLine, ok := labelToLine[lookupLabel]; ok {
+			lookupLabel := normalizeLabel(targetLabel)
+			if targetLine, ok := ctx.LabelToLine[lookupLabel]; ok {
 				// Only consider targets that come after firstSVE (bypass paths)
-				if targetLine > firstSVE {
+				if targetLine > ctx.FirstSVE {
 					branchTargetsBeforeFirstSVE[targetLine] = true
 				}
 			}
@@ -453,7 +442,7 @@ func injectStreamingModeConservative(lines []*arm64Line, firstSVE int) []*arm64L
 	smstartPositions := make(map[int]bool)
 
 	// Always inject before firstSVE
-	smstartPositions[firstSVE] = true
+	smstartPositions[ctx.FirstSVE] = true
 
 	// For each branch target that bypasses firstSVE, find first SVE in that block.
 	// We scan forward through fallthrough blocks (labels don't stop execution flow)
@@ -541,29 +530,9 @@ func isSVEInstruction(asm string) bool {
 }
 
 // ensureSmstopBeforeRet adds smstop before all ret instructions in an SVE function.
-// This handles cases where the compiler generated smstart but not smstop, and
-// also handles complex control flow where some paths may bypass streaming mode.
+// The caller has already verified that smstart is present.
 // smstop when not in streaming mode is a no-op, so it's safe to add conservatively.
-//
-// IMPORTANT: We must add smstop before ALL ret instructions, even if some paths
-// already have smstop. This is because C code with multiple code paths may have:
-// - Main path: smstart -> ... -> ret (no smstop!)
-// - Edge path: smstart -> ... -> smstop -> ret (has smstop)
-// The edge path's smstop doesn't protect the main path's ret.
 func ensureSmstopBeforeRet(lines []*arm64Line) []*arm64Line {
-	// Find if there's an smstart
-	hasSmstart := false
-	for _, line := range lines {
-		if line.Assembly != "" && strings.Contains(line.Assembly, "smstart") {
-			hasSmstart = true
-			break
-		}
-	}
-
-	if !hasSmstart {
-		return lines // No smstart, nothing to do
-	}
-
 	// Add smstop before ALL ret instructions that don't already have one.
 	// smstop when not in streaming mode is a no-op, so it's safe to add.
 	result := make([]*arm64Line, 0, len(lines)+5)

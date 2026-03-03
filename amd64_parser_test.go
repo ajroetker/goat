@@ -148,10 +148,10 @@ func TestAmd64ConstPoolLabelRegex(t *testing.T) {
 	}{
 		{".LCPI0_0:", true},
 		{".LCPI12_34:", true},
-		{"LCPI0_0:", true},    // macOS style (no dot)
-		{"LCPI99_99:", true},  // macOS style
-		{".LBB0_1:", false},   // branch label, not const pool
-		{"LBB0_1:", false},    // branch label
+		{"LCPI0_0:", true},   // macOS style (no dot)
+		{"LCPI99_99:", true}, // macOS style
+		{".LBB0_1:", false},  // branch label, not const pool
+		{"LBB0_1:", false},   // branch label
 		{"_my_function:", false},
 		{"some_label:", false},
 	}
@@ -174,7 +174,7 @@ func TestAmd64RIPRelativeConstPoolRegex(t *testing.T) {
 	}{
 		{".LCPI0_0(%rip)", true, "0_0"},
 		{".LCPI12_34(%rip)", true, "12_34"},
-		{"LCPI0_0(%rip)", true, "0_0"},      // macOS style
+		{"LCPI0_0(%rip)", true, "0_0"}, // macOS style
 		{"vmovaps .LCPI0_0(%rip), %ymm0", true, "0_0"},
 		{"movq .LCPI5_6(%rip), %xmm0", true, "5_6"},
 		{"leaq .LCPI0_0(%rip), %rax", true, "0_0"},
@@ -293,10 +293,9 @@ func TestAmd64RewriteConstPoolRef(t *testing.T) {
 }
 
 func TestAmd64ConstPoolStruct(t *testing.T) {
-	pool := &amd64ConstPool{
+	pool := &ConstPool{
 		Label: "CPI0_0",
 		Data:  []uint32{0x3f800000, 0x40000000, 0x40400000, 0x40800000},
-		Size:  16,
 	}
 
 	if pool.Label != "CPI0_0" {
@@ -304,8 +303,5 @@ func TestAmd64ConstPoolStruct(t *testing.T) {
 	}
 	if len(pool.Data) != 4 {
 		t.Errorf("len(Data) = %d, want 4", len(pool.Data))
-	}
-	if pool.Size != 16 {
-		t.Errorf("Size = %d, want 16", pool.Size)
 	}
 }

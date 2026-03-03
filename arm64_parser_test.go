@@ -320,10 +320,10 @@ func TestConstPoolLabelRegex(t *testing.T) {
 		{"CPI0_0:", true},
 		{"lCPI12_34:", true},
 		{".LCPI99_99:", true},
-		{"LBB0_1:", false},        // branch label, not const pool
-		{".LBB0_1:", false},       // branch label, not const pool
-		{"_my_function:", false},  // function name
-		{"some_label:", false},    // generic label
+		{"LBB0_1:", false},       // branch label, not const pool
+		{".LBB0_1:", false},      // branch label, not const pool
+		{"_my_function:", false}, // function name
+		{"some_label:", false},   // generic label
 	}
 
 	for _, tt := range tests {
@@ -346,7 +346,7 @@ func TestLongDirectiveRegex(t *testing.T) {
 		{"\t.long\t1", true, "1"},
 		{"\t.long\t0x3f800000", true, "0x3f800000"},
 		{"  .long  12345", true, "12345"},
-		{"\t.quad\t0", false, ""},  // quad, not long
+		{"\t.quad\t0", false, ""},    // quad, not long
 		{"\tadd\tx0, x1", false, ""}, // not a directive
 	}
 
@@ -495,10 +495,9 @@ func TestLdrConstPoolPageoffRegex(t *testing.T) {
 }
 
 func TestConstPoolStruct(t *testing.T) {
-	pool := &arm64ConstPool{
+	pool := &ConstPool{
 		Label: "CPI0_0",
 		Data:  []uint32{0, 1, 2, 3},
-		Size:  16,
 	}
 
 	if pool.Label != "CPI0_0" {
@@ -506,8 +505,5 @@ func TestConstPoolStruct(t *testing.T) {
 	}
 	if len(pool.Data) != 4 {
 		t.Errorf("len(Data) = %d, want 4", len(pool.Data))
-	}
-	if pool.Size != 16 {
-		t.Errorf("Size = %d, want 16", pool.Size)
 	}
 }

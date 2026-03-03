@@ -15,11 +15,9 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 	"unicode"
 
@@ -32,12 +30,8 @@ type Loong64Parser struct{}
 
 // loong64 regex patterns
 var (
-	loong64AttributeLine = regexp.MustCompile(`^\s+\..+$`)
-	loong64NameLine      = regexp.MustCompile(`^\w+:.+$`)
-	loong64LabelLine     = regexp.MustCompile(`^\.\w+_\d+:.*$`)
-	loong64CodeLine      = regexp.MustCompile(`^\s+\w+.+$`)
-	loong64SymbolLine    = regexp.MustCompile(`^\w+\s+<\w+>:$`)
-	loong64DataLine      = regexp.MustCompile(`^\w+:\s+\w+\s+.+$`)
+	loong64LabelLine = regexp.MustCompile(`^\.\w+_\d+:.*$`)
+	loong64CodeLine  = regexp.MustCompile(`^\s+\w+.+$`)
 
 	// Constant pool patterns
 	// Match constant pool labels: .LCPI0_0:
@@ -110,13 +104,6 @@ type loong64Line struct {
 	Binary   string
 }
 
-// loong64ConstPool represents a constant pool entry with its label and data
-type loong64ConstPool struct {
-	Label string   // e.g., "CPI0_0" (without leading .L)
-	Data  []uint32 // Data as 32-bit words (for .word directives)
-	Size  int      // Total size in bytes
-}
-
 func (line *loong64Line) String() string {
 	var builder strings.Builder
 	builder.WriteString("\t")
@@ -177,8 +164,8 @@ func (p *Loong64Parser) Prologue() string {
 	var prologue strings.Builder
 	prologue.WriteString("#define GOAT_PARSER 1\n")
 	// Define include guards for LoongArch SIMD headers
-	prologue.WriteString("#define _LSXINTRIN_H 1\n")   // LSX (128-bit SIMD)
-	prologue.WriteString("#define _LASXINTRIN_H 1\n")   // LASX (256-bit SIMD)
+	prologue.WriteString("#define _LSXINTRIN_H 1\n")  // LSX (128-bit SIMD)
+	prologue.WriteString("#define _LASXINTRIN_H 1\n") // LASX (256-bit SIMD)
 	return prologue.String()
 }
 
@@ -212,126 +199,54 @@ func (p *Loong64Parser) TranslateAssembly(t *TranslateUnit, functions []Function
 	return p.generateGoAssembly(t, functions, assembly, constPools)
 }
 
-func (p *Loong64Parser) parseAssembly(path string) (map[string][]*loong64Line, map[string]int, map[string]*loong64ConstPool, error) {
-	file, err := os.Open(path)
+func (p *Loong64Parser) parseAssembly(path string) (map[string][]*loong64Line, map[string]int, map[string]*ConstPool, error) {
+	scanner, cleanup, err := openAssemblyFile(path)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	defer func(file *os.File) {
-		if err = file.Close(); err != nil {
-			_, _ = fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-	}(file)
+	defer cleanup()
 
 	var (
 		stackSizes   = make(map[string]int)
 		functions    = make(map[string][]*loong64Line)
-		constPools   = make(map[string]*loong64ConstPool)
+		cpa          = NewConstPoolAccumulator()
 		functionName string
 		labelName    string
-		// Constant pool parsing state
-		currentConstPool  *loong64ConstPool
-		currentConstLabel string
-		byteAccum         uint32 // accumulates .byte values into 32-bit words (little-endian)
-		byteCount         int    // number of bytes accumulated (0-3)
 	)
-	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
 
 		// Check for constant pool label (.LCPI0_0:)
 		if loong64ConstPoolLabel.MatchString(line) {
-			// Flush partial byte accumulation and save previous constant pool
-			if currentConstPool != nil {
-				if byteCount > 0 {
-					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-					currentConstPool.Size += 4
-					byteAccum = 0
-					byteCount = 0
-				}
-				if len(currentConstPool.Data) > 0 {
-					constPools[currentConstLabel] = currentConstPool
-				}
-			}
-			// Start new constant pool
-			labelPart := strings.Split(line, ":")[0]
-			// Normalize label: strip leading .L to get CPI0_0
-			labelPart = strings.TrimPrefix(labelPart, ".L")
-			currentConstLabel = labelPart
-			currentConstPool = &loong64ConstPool{
-				Label: labelPart,
-				Data:  make([]uint32, 0),
-			}
+			labelPart := strings.TrimPrefix(strings.Split(line, ":")[0], ".L")
+			cpa.StartPool(labelPart)
 			continue
 		}
 
 		// Parse .word/.dword/.byte directives for constant pool data
-		if currentConstPool != nil {
+		if cpa.Active() {
 			if matches := loong64WordDirective.FindStringSubmatch(line); matches != nil {
-				// Flush any partial byte accumulation
-				if byteCount > 0 {
-					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-					currentConstPool.Size += 4
-					byteAccum = 0
-					byteCount = 0
-				}
-				val := loong64ParseIntValue(matches[1])
-				currentConstPool.Data = append(currentConstPool.Data, uint32(val))
-				currentConstPool.Size += 4
+				cpa.AddLong(parseIntValue(matches[1]))
 				continue
 			}
-			// Parse .dword directives for constant pool data (64-bit)
 			if matches := loong64DwordDirective.FindStringSubmatch(line); matches != nil {
-				// Flush any partial byte accumulation
-				if byteCount > 0 {
-					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-					currentConstPool.Size += 4
-					byteAccum = 0
-					byteCount = 0
-				}
-				val := loong64ParseIntValue(matches[1])
-				// Store dword as two 32-bit words (little-endian)
-				currentConstPool.Data = append(currentConstPool.Data, uint32(val), uint32(val>>32))
-				currentConstPool.Size += 8
+				cpa.AddQuad(parseIntValue(matches[1]))
 				continue
 			}
 			if matches := loong64ByteDirective.FindStringSubmatch(line); matches != nil {
-				val := loong64ParseIntValue(matches[1])
-				// Accumulate bytes into 32-bit words (little-endian)
-				byteAccum |= uint32(val&0xFF) << (byteCount * 8)
-				byteCount++
-				if byteCount == 4 {
-					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-					currentConstPool.Size += 4
-					byteAccum = 0
-					byteCount = 0
-				}
+				cpa.AccumulateByte(parseIntValue(matches[1]))
 				continue
 			}
 		}
 
 		// Check for section change or function start that ends constant pool parsing
-		if loong64NameLine.MatchString(line) || strings.HasPrefix(strings.TrimSpace(line), ".section") {
-			// Flush partial byte accumulation and save current constant pool
-			if currentConstPool != nil {
-				if byteCount > 0 {
-					currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-					currentConstPool.Size += 4
-					byteAccum = 0
-					byteCount = 0
-				}
-				if len(currentConstPool.Data) > 0 {
-					constPools[currentConstLabel] = currentConstPool
-				}
-				currentConstPool = nil
-				currentConstLabel = ""
-			}
+		if nameLine.MatchString(line) || strings.HasPrefix(strings.TrimSpace(line), ".section") {
+			cpa.FinishPool()
 		}
 
-		if loong64AttributeLine.MatchString(line) {
+		if attributeLine.MatchString(line) {
 			continue
-		} else if loong64NameLine.MatchString(line) {
+		} else if nameLine.MatchString(line) {
 			functionName = strings.Split(line, ":")[0]
 			functions[functionName] = make([]*loong64Line, 0)
 		} else if loong64LabelLine.MatchString(line) {
@@ -359,31 +274,13 @@ func (p *Loong64Parser) parseAssembly(path string) (map[string][]*loong64Line, m
 	}
 
 	// Save any remaining constant pool
-	if currentConstPool != nil {
-		if byteCount > 0 {
-			currentConstPool.Data = append(currentConstPool.Data, byteAccum)
-			currentConstPool.Size += 4
-		}
-		if len(currentConstPool.Data) > 0 {
-			constPools[currentConstLabel] = currentConstPool
-		}
-	}
+	cpa.FinishPool()
+	constPools := cpa.Pools()
 
 	if err = scanner.Err(); err != nil {
 		return nil, nil, nil, err
 	}
 	return functions, stackSizes, constPools, nil
-}
-
-// loong64ParseIntValue parses a decimal or hex integer value from a string
-func loong64ParseIntValue(s string) uint64 {
-	s = strings.TrimSpace(s)
-	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
-		val, _ := strconv.ParseUint(s[2:], 16, 64)
-		return val
-	}
-	val, _ := strconv.ParseUint(s, 10, 64)
-	return val
 }
 
 func (p *Loong64Parser) parseObjectDump(dump string, functions map[string][]*loong64Line) error {
@@ -393,33 +290,18 @@ func (p *Loong64Parser) parseObjectDump(dump string, functions map[string][]*loo
 	)
 	for i, line := range strings.Split(dump, "\n") {
 		line = strings.TrimSpace(line)
-		if loong64SymbolLine.MatchString(line) {
-			functionName = strings.Split(line, "<")[1]
-			functionName = strings.Split(functionName, ">")[0]
+		if symbolLine.MatchString(line) {
+			functionName = extractObjDumpFunctionName(line, "")
 			lineNumber = 0
-		} else if loong64DataLine.MatchString(line) {
-			data := strings.Split(line, ":")[1]
-			data = strings.TrimSpace(data)
-			splits := strings.Split(data, " ")
-			var (
-				binary   string
-				assembly string
-			)
-			for i, s := range splits {
-				if s == "" || unicode.IsSpace(rune(s[0])) {
-					assembly = strings.Join(splits[i:], " ")
-					assembly = strings.TrimSpace(assembly)
-					break
-				}
-				binary = s
-			}
-			if assembly == "nop" {
+		} else if dataLine.MatchString(line) {
+			binaryTokens, assembly := parseObjDumpDataLine(line)
+			if len(binaryTokens) == 0 || assembly == "nop" {
 				continue
 			}
 			if lineNumber >= len(functions[functionName]) {
 				return fmt.Errorf("%d: unexpected objectdump line: %s", i, line)
 			}
-			functions[functionName][lineNumber].Binary = binary
+			functions[functionName][lineNumber].Binary = binaryTokens[len(binaryTokens)-1]
 			lineNumber++
 		}
 	}
@@ -440,25 +322,12 @@ func loong64GoRegisterName(loongReg string) string {
 	return strings.ToUpper(loongReg)
 }
 
-func (p *Loong64Parser) generateGoAssembly(t *TranslateUnit, functions []Function, assembly map[string][]*loong64Line, constPools map[string]*loong64ConstPool) error {
+func (p *Loong64Parser) generateGoAssembly(t *TranslateUnit, functions []Function, assembly map[string][]*loong64Line, constPools map[string]*ConstPool) error {
 	var builder strings.Builder
 	builder.WriteString(p.BuildTags())
 	t.writeHeader(&builder)
 
-	// Emit DATA/GLOBL directives for constant pools
-	if len(constPools) > 0 {
-		builder.WriteString("\n#include \"textflag.h\"\n")
-		builder.WriteString("\n// Constant pool data\n")
-		for label, pool := range constPools {
-			// Emit DATA directive with little-endian byte order
-			// Format: DATA symbol<>+offset(SB)/size, $value
-			for i, val := range pool.Data {
-				builder.WriteString(fmt.Sprintf("DATA %s<>+%d(SB)/4, $0x%08x\n", label, i*4, val))
-			}
-			// Emit GLOBL directive to define the symbol size
-			builder.WriteString(fmt.Sprintf("GLOBL %s<>(SB), (RODATA|NOPTR), $%d\n", label, pool.Size))
-		}
-	}
+	emitConstPools(&builder, constPools)
 
 	for _, function := range functions {
 		// Calculate return size based on type
